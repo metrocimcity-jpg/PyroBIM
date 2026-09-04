@@ -178,21 +178,76 @@ class FdsModel:
         )
         return self._add(block, mesh_id)
 
+    # Custom fuels need an explicit &SPEC formula; bare FUEL='POLYURETHANE'
+    # has no built-in composition and triggers FDS ERROR(171) carbon balance.
+    # Use per-carbon (~C1) formulas so MW stays low and PyroSim/FDS do not
+    # abort on "high molecular weight fuels not in the FDS database".
+    FUEL_FORMULAS: dict[str, str] = {
+        "POLYURETHANE": "C1H1.13O0.33N0.16",  # equiv. C6.3H7.1N1O2.1 / 6.3
+    }
+    FUEL_SPECIFIC_HEAT: dict[str, float] = {
+        "POLYURETHANE": 1.0,  # kJ/(kg·K)
+    }
+
+    def _reac_text(
+        self,
+        fuel: str,
+        soot_yield: float,
+        co_yield: float,
+        reac_id: str,
+        hcn_yield: float | None = 0.0,
+        heat_of_combustion: float | None = 25300.0,
+    ) -> tuple[str | None, str]:
+        """Return optional &SPEC block and &REAC block for fuel chemistry."""
+        formula = self.FUEL_FORMULAS.get(fuel.upper())
+        spec_block = None
+        if formula:
+            parts = [f"&SPEC ID='{fuel}', FORMULA='{formula}'"]
+            cp = self.FUEL_SPECIFIC_HEAT.get(fuel.upper())
+            if cp is not None:
+                parts.append(f", SPECIFIC_HEAT={fds_num(cp)}")
+            spec_block = "".join(parts) + " /"
+        reac_parts = [
+            f"&REAC ID='{reac_id}', FUEL='{fuel}', "
+            f"SOOT_YIELD={fds_num(soot_yield)}, CO_YIELD={fds_num(co_yield)}"
+        ]
+        if hcn_yield is not None:
+            reac_parts.append(f", HCN_YIELD={fds_num(hcn_yield)}")
+        if heat_of_combustion is not None and fuel.upper() in self.FUEL_FORMULAS:
+            reac_parts.append(f", HEAT_OF_COMBUSTION={fds_num(heat_of_combustion)}")
+        reac_block = "".join(reac_parts) + " /"
+        return spec_block, reac_block
+
     def add_reac(
         self,
         fuel: str = "POLYURETHANE",
         soot_yield: float = 0.10,
         co_yield: float = 0.05,
         reac_id: str | None = None,
+        hcn_yield: float | None = 0.0,
+        heat_of_combustion: float | None = 25300.0,
     ) -> str:
         if any(b.strip().upper().startswith("&REAC") for b in self.blocks):
             raise ValueError("A &REAC group is already present")
-        reac_id = reac_id or fuel
-        block = (
-            f"&REAC ID='{reac_id}', FUEL='{fuel}', "
-            f"SOOT_YIELD={fds_num(soot_yield)}, CO_YIELD={fds_num(co_yield)} /"
+        needs_spec = fuel.upper() in self.FUEL_FORMULAS
+        # SPEC and REAC both use ID=; keep them distinct in our ID registry.
+        reac_id = reac_id or (f"{fuel}_RXN" if needs_spec else fuel)
+        spec_block, reac_block = self._reac_text(
+            fuel,
+            soot_yield,
+            co_yield,
+            reac_id,
+            hcn_yield=hcn_yield,
+            heat_of_combustion=heat_of_combustion,
         )
-        return self._add(block, reac_id)
+        written: list[str] = []
+        if spec_block and not any(
+            b.strip().upper().startswith("&SPEC") and f"ID='{fuel}'" in b
+            for b in self.blocks
+        ):
+            written.append(self._add(spec_block, fuel))
+        written.append(self._add(reac_block, reac_id))
+        return "\n".join(written)
 
     def set_reac(
         self,
@@ -200,22 +255,40 @@ class FdsModel:
         soot_yield: float = 0.10,
         co_yield: float = 0.05,
         reac_id: str | None = None,
+        hcn_yield: float | None = 0.0,
+        heat_of_combustion: float | None = 25300.0,
     ) -> str:
-        """Add or replace the model's single &REAC group."""
-        reac_id = reac_id or fuel
-        block = (
-            f"&REAC ID='{reac_id}', FUEL='{fuel}', "
-            f"SOOT_YIELD={fds_num(soot_yield)}, CO_YIELD={fds_num(co_yield)} /"
+        """Add or replace the model's single &REAC group (and fuel &SPEC if needed)."""
+        needs_spec = fuel.upper() in self.FUEL_FORMULAS
+        reac_id = reac_id or (f"{fuel}_RXN" if needs_spec else fuel)
+        spec_block, reac_block = self._reac_text(
+            fuel,
+            soot_yield,
+            co_yield,
+            reac_id,
+            hcn_yield=hcn_yield,
+            heat_of_combustion=heat_of_combustion,
         )
-        for index, existing in enumerate(self.blocks):
-            if existing.strip().upper().startswith("&REAC"):
-                old_ids = extract_ids(existing)
-                self.used_ids -= old_ids
-                if reac_id not in self.used_ids:
-                    self.used_ids.add(reac_id)
-                self.blocks[index] = block
-                return block
-        return self._add(block, reac_id)
+        kept: list[str] = []
+        for existing in self.blocks:
+            upper = existing.strip().upper()
+            if upper.startswith("&REAC"):
+                self.used_ids -= extract_ids(existing)
+                continue
+            if (
+                needs_spec
+                and upper.startswith("&SPEC")
+                and f"ID='{fuel.upper()}'" in upper.replace('"', "'")
+            ):
+                self.used_ids -= extract_ids(existing)
+                continue
+            kept.append(existing)
+        self.blocks = kept
+        written: list[str] = []
+        if spec_block:
+            written.append(self._add(spec_block, fuel))
+        written.append(self._add(reac_block, reac_id))
+        return "\n".join(written)
 
     def add_surf_with_ramp(
         self,
@@ -293,7 +366,7 @@ class FdsModel:
         dt_devc: float | None = None,
         column_dump_limit: bool | None = True,
     ) -> str:
-        parts = ["&DUMP"]
+        parts: list[str] = []
         if render_file:
             parts.append(f"RENDER_FILE='{render_file}'")
         if nframes is not None:
@@ -308,7 +381,10 @@ class FdsModel:
             parts.append(f"DT_DEVC={fds_num(dt_devc)}")
         if column_dump_limit is not None:
             parts.append(f"COLUMN_DUMP_LIMIT={fds_bool(column_dump_limit)}")
-        block = ", ".join(parts) + " /"
+        if not parts:
+            block = "&DUMP /"
+        else:
+            block = "&DUMP " + ", ".join(parts) + " /"
         return self._replace_group("DUMP", block)
 
     def set_misc(self, tmpa: float | None = None, extra: dict[str, str] | None = None) -> str:

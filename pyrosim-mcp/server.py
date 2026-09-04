@@ -77,7 +77,6 @@ def _ensure_reac(model: FdsModel, preset: dict) -> str | None:
         fuel=preset.get("fuel", "POLYURETHANE"),
         soot_yield=float(preset.get("soot_yield", 0.10)),
         co_yield=float(preset.get("co_yield", 0.05)),
-        reac_id=preset.get("fuel", "POLYURETHANE"),
     )
 
 
