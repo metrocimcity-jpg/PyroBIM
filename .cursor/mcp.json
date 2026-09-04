@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "pyrosim": {
+      "command": "C:\\Users\\SIGNAL\\.cursor\\projects\\PyroBIM\\pyrosim-mcp\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\SIGNAL\\.cursor\\projects\\PyroBIM\\pyrosim-mcp\\server.py"
+      ],
+      "env": {
+        "PYROSIM_SAMPLES": "D:\\@LIB\\PyroSim\\Samples"
+      }
+    }
+  }
+}
