@@ -16,6 +16,16 @@ flowchart LR
   E --> G[Smokeview]
 ```
 
+## Sample
+
+Illustrative temperature slice of a compartment fire: floor burner, plume, and ceiling jet. The MCP writes the matching `&MESH`, `&REAC`, `&SURF`/`&OBST` fire, `&SLCF` (with `PBX`/`PBY`/`PBZ` or `XB`), sprinklers, and vents.
+
+<p align="center">
+  <img src="docs/sample-temperature-slice.png" alt="Sample temperature slice of a compartment fire plume and ceiling jet at 20 seconds" width="100%">
+</p>
+
+Prompt to recreate the setup: *“Create a 5×5×3 m room and add a couch fire in the corner. Add a pendent sprinkler, a supply vent, and a temperature slice through the fire.”*
+
 ## What it does
 
 | Area | Tools |
@@ -60,7 +70,7 @@ Point Cursor at the venv interpreter in `.cursor/mcp.json`:
 
 Optional env: `FDS_EXE`, `SMOKEVIEW_EXE`, `PYROSIM_EXE`, `PYROSIM_SAMPLES`.
 
-Restart MCP, then try: *“Create a 5×5×3 m room and add a couch fire in the corner.”*
+Restart MCP, then try the sample prompt above.
 
 ## Layout
 
@@ -75,6 +85,7 @@ pyrosim-mcp/
   catalog.py         slices, devices, flow notes
   test_fds.py
 .cursor/             tool spec + 100 sample prompts
+docs/                README images
 ```
 
 ## Notes
