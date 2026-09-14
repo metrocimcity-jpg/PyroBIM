@@ -7,11 +7,12 @@ Current capabilities:
 - New/import/validate models; open PyroSim, FDS, Smokeview
 - Fire presets (couch, cigarette, car, wastebasket) and specified-HRR / HRRPUA / burn-away fires
 - Simple chemistry (`&REAC`), UMD FireBID materials, layered surfaces
-- NFPA 13/13D/13R/15 sprinklers, heat detectors, smoke detectors, activation controls
+- NFPA 13/13D/13R/15 sprinklers; NFPA 72 smoke/heat; CO/LEL gas; beam, aspiration, flame; activation controls
 - HVAC fans, flow vents, leakage zones, wind, velocity patches
 - NFPA 502 critical velocity and D\*/10 mesh guidance
 - Slices, isosurfaces, devices, smoke visualization
 - PyroSim sample library under `PYROSIM_SAMPLES`
+- NIST FDS Validation (135 series) via `list_fds_validation` / `open_fds_validation`
 
 ## Why text-based
 PyroSim’s native format is a `.fds` file (Fortran namelists). Editing namelists is reliable and headless.

@@ -266,6 +266,83 @@ class ToolWorkflowTests(unittest.TestCase):
         valid = server.validate_fds()
         self.assertTrue(valid.startswith("VALID"), valid)
 
+    def test_detector_catalog(self):
+        listing = server.list_detectors()
+        for name in (
+            "ionization",
+            "photoelectric",
+            "heskestad",
+            "ordinary",
+            "co",
+            "beam",
+            "aspiration",
+            "flame",
+        ):
+            self.assertIn(name, listing)
+        server.new_model("det", [0, 8, 0, 8, 0, 3], 0.2)
+        ion = server.add_smoke_detector([4, 4, 2.9], "ionization")
+        self.assertIn("CHAMBER OBSCURATION", ion)
+        self.assertIn("SMOKEVIEW_ID='smoke_detector'", ion)
+        self.assertIn("ALPHA_E=2.5", ion)
+        photo = server.add_smoke_detector([4, 5, 2.9], "photoelectric")
+        self.assertIn("ALPHA_E=1.8", photo)
+        hes = server.add_smoke_detector([5, 4, 2.9], "heskestad")
+        self.assertIn("LENGTH=1.8", hes)
+        self.assertIn("ACTIVATION_OBSCURATION=3.24", hes)
+        heat = server.add_heat_detector([4, 4, 2.9], "ordinary")
+        self.assertIn("LINK TEMPERATURE", heat)
+        self.assertIn("ACTIVATION_TEMPERATURE=57.2", heat)
+        self.assertIn("SMOKEVIEW_ID='heat_detector'", heat)
+        co = server.add_gas_detector([4, 4, 1.5], "co")
+        self.assertIn("SPEC_ID='CARBON MONOXIDE'", co)
+        self.assertIn("SETPOINT=7e-05", co)  # may format as 0.00007
+        beam = server.add_beam_detector([1, 1, 2.5], [7, 1, 2.5], setpoint=15.0)
+        self.assertIn("PATH OBSCURATION", beam)
+        asp = server.add_aspiration_detector(
+            [0.5, 0.5, 0.5],
+            [[2, 2, 2.8], [6, 2, 2.8]],
+            flowrate=0.3,
+        )
+        self.assertIn("QUANTITY='ASPIRATION'", asp)
+        self.assertIn("FLOWRATE=0.3", asp)
+        flame = server.add_flame_detector([1, 4, 2.5], setpoint=5.0)
+        self.assertIn("RADIATIVE HEAT FLUX GAS", flame)
+        vis = server.add_tenability_device("visibility", position=[4, 4, 1.8], setpoint=10.0)
+        self.assertIn("VISIBILITY", vis)
+        valid = server.validate_fds()
+        self.assertTrue(valid.startswith("VALID"), valid)
+
+    def test_fds_validation_catalog_covers_github(self):
+        import validation
+
+        self.assertEqual(len(validation.SERIES), 135)
+        listing = server.list_fds_validation("McCaffrey")
+        self.assertIn("McCaffrey_Plume", listing)
+        self.assertIn("add_line_device", listing)
+        tunnels = server.list_fds_validation(category="tunnel")
+        self.assertIn("Memorial_Tunnel", tunnels)
+        self.assertIn("Wu_Bakar_Tunnels", tunnels)
+        guide = server.fds_validation_guidance("sprinkler")
+        self.assertIn("Vettori_Flat_Ceiling", guide)
+
+    def test_validation_patterns(self):
+        server.new_model("val", [0, 10, 0, 10, 0, 3], 0.2)
+        line = server.add_line_device("THERMOCOUPLE", [5, 5, 5, 5, 0, 3], points=30)
+        self.assertIn("POINTS=30", line)
+        self.assertIn("Z_ID='Height'", line)
+        tau = server.add_hrr_fire(45.0, 0.09, [4.85, 4.85, 0], fuel="NATURAL_GAS", tau_q=-1.0)
+        self.assertIn("TAU_Q=-1", tau)
+        self.assertIn("HRRPUA=", tau)
+        wind = server.set_wind(4.6, direction=270.0, z_0=0.03, monin_obukhov_length=-500.0)
+        self.assertIn("Z_0=0.03", wind)
+        self.assertIn("L=-500", wind)
+        veg = server.add_vegetation_bed([0, 10, 0, 10, 0, 0.21], packing_ratio=0.0026)
+        self.assertIn("PACKING_RATIO=0.0026", veg)
+        self.assertIn("N_PARTICLES_PER_CELL=1", veg)
+        self.assertIn("STATIC=.TRUE.", veg)
+        valid = server.validate_fds()
+        self.assertTrue(valid.startswith("VALID"), valid)
+
     def test_t_squared_peak_matches_alpha(self):
         alpha = presets.GROWTH_ALPHA["ultra-fast"]
         peak = 2500.0

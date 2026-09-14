@@ -80,6 +80,37 @@ FUELS: dict[str, dict[str, Any]] = {
         "radiative_fraction": 0.35,
         "description": "Cellulosic / wood-crib simple chemistry.",
     },
+    "CELLULOSE": {
+        "fuel": "CELLULOSE",
+        "c": 6.0,
+        "h": 10.0,
+        "o": 5.0,
+        "soot_yield": 0.02,
+        "co_yield": 0.0,
+        "heat_of_combustion": 15600.0,
+        "radiative_fraction": 0.35,
+        "description": "CSIRO grassland / vegetation Validation (C6H10O5).",
+    },
+    "NATURAL_GAS": {
+        "fuel": "LNG",
+        "formula": "C1.2143H4.4286",
+        "needs_spec": True,
+        "soot_yield": 0.0,
+        "co_yield": 0.0,
+        "heat_of_combustion": 45000.0,
+        "radiative_fraction": 0.27,
+        "description": "McCaffrey plume Validation natural-gas burner (NBSIR 79-1910).",
+    },
+    "METHANOL": {
+        "fuel": "METHANOL",
+        "formula": "CH3OH",
+        "needs_spec": True,
+        "soot_yield": 0.0,
+        "co_yield": 0.0,
+        "heat_of_combustion": 20000.0,
+        "radiative_fraction": 0.18,
+        "description": "Waterloo methanol pool-fire Validation.",
+    },
 }
 
 FUEL_ALIASES = {
@@ -88,8 +119,11 @@ FUEL_ALIASES = {
     "PU": "POLYURETHANE",
     "GM27": "POLYURETHANE_GM27",
     "POLYURETHANE GM27": "POLYURETHANE_GM27",
-    "CELLULOSE": "WOOD",
+    "CELLULOSE": "CELLULOSE",
     "WOOD CRIB": "WOOD",
+    "LNG": "NATURAL_GAS",
+    "NATURAL GAS": "NATURAL_GAS",
+    "METHANOL": "METHANOL",
 }
 
 

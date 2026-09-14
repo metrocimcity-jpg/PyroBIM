@@ -1,4 +1,4 @@
-# PyroSim MCP — 100 example prompts
+# PyroSim MCP — example prompts
 
 Use these with the connected **pyrosim** MCP server. Prefer calling tools over hand-writing namelists.
 
@@ -127,6 +127,36 @@ Tunnels, jet fans, car parks, multi-system protection, and design checks.
 
 ---
 
+## NIST FDS Validation (101–110)
+
+[firemodels/fds Validation](https://github.com/firemodels/fds/tree/master/Validation) — 135 series. Prefer `list_fds_validation` / `open_fds_validation` over guessing paths.
+
+101. List FDS Validation series about tunnels.
+102. What is the McCaffrey plume series, and which local cases are available?
+103. Open `McCaffrey_45_kW_21.fds` from the McCaffrey_Plume Validation folder as an editable copy.
+104. Recreate a McCaffrey-style 45 kW natural-gas burner with a 30-point thermocouple line up the plume axis.
+105. Open a Steckler compartment case and tell me how the door HOLE and burner VENT are set.
+106. Add a CSIRO-style grassland vegetation bed over 0–20 m by 0–20 m, packing ratio 0.0026, with a 4.6 m/s west wind (Z_0=0.03, L=-500).
+107. Which Validation series should I copy for sprinkler / ceiling-jet work?
+108. Open a NIST pool-fire Validation case that uses a circular RADIUS vent.
+109. Point me at Memorial Tunnel and Wu–Bakar Validation inputs for NFPA 502 critical velocity.
+110. Summarize how FDS Validation maps to this MCP (`fds_validation_guidance`).
+
+## Detectors (111–120)
+
+111. What smoke, heat, and gas detectors can this MCP add?
+112. Put an ionization smoke detector at the ceiling centroid (2.5, 2.5, 2.9).
+113. Add a photoelectric smoke detector at (1, 1, 2.9) using the NIST Dunes 2000 photo preset.
+114. Add an ordinary NFPA 72 heat detector (135 °F) next to the smoke detector.
+115. Add a 70 ppm CO detector at 1.5 m height, and a propane 10 % LEL detector near the floor.
+116. Stretch a projected-beam smoke detector from (0.5, 2.5, 2.7) to (4.5, 2.5, 2.7) with a 15 % trip.
+117. Add a VESDA-style aspiration detector in the cabinet at (0.2, 0.2, 0.3) sampling (2,2,2.8) and (4,2,2.8).
+118. Aim a flame detector at the burner from (0.5, 2.5, 2.0) looking +X, 5 kW/m².
+119. Add a 10 m visibility tenability probe at (2.5, 2.5, 1.8) and an optical-density probe at the same point.
+120. Open the NIST_Smoke_Alarms Validation series and tell me which ionization vs photoelectric PROPs it uses.
+
+---
+
 ## How to use a prompt
 
 - **One task per message** for beginner items; chain 3–5 tools for intermediate.
@@ -144,7 +174,9 @@ Tunnels, jet fans, car parks, multi-system protection, and design checks.
 | burn-away solid | `add_hrrpua_fire` |
 | Oak / gypsum wall | `list_materials`, `add_material`, `add_layered_surface` |
 | pendent / sidewall / ESFR | `list_sprinklers`, `add_sprinkler` |
+| smoke / heat / CO / beam | `list_detectors`, `add_smoke_detector`, `add_heat_detector`, `add_gas_detector` |
 | tunnel V_c | `nfpa_502_critical_velocity` |
 | jet fan | `add_velocity_patch`, `add_flow_vent`, `add_hvac_fan` |
 | smoke / slices | `show_smoke`, `create_2d_slice` |
-| what can this MCP do? | `pyrosim_examples_index`, `list_catalog` |
+| what can this MCP do? | `pyrosim_examples_index`, `list_catalog`, `list_fds_validation` |
+| NIST Validation case | `list_fds_validation`, `open_fds_validation` |

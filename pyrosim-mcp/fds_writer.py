@@ -59,16 +59,20 @@ def fds_fyi(text: str | None) -> str | None:
     return cleaned[:120] or None
 
 
-def format_xb(bounds: list[float] | tuple[float, ...], *, planar: bool = False) -> str:
+def format_xb(bounds: list[float] | tuple[float, ...], *, planar: bool = False, linear: bool = False) -> str:
     if len(bounds) != 6:
         raise ValueError("bounds must be [x0, x1, y0, y1, z0, z1]")
     extents = [bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]]
     if any(extent < -1e-12 for extent in extents):
         raise ValueError("Each max bound must be greater than or equal to the corresponding min")
     positive = sum(extent > 1e-12 for extent in extents)
-    needed = 2 if planar else 3
+    if linear:
+        needed, kind = 1, "a line (one extent)"
+    elif planar:
+        needed, kind = 2, "a plane (two extents)"
+    else:
+        needed, kind = 3, "a volume (three extents)"
     if positive < needed:
-        kind = "a plane (two extents)" if planar else "a volume (three extents)"
         raise ValueError(f"XB must describe {kind}")
     return ",".join(fds_num(v) for v in bounds)
 
@@ -158,6 +162,7 @@ class FdsModel:
         self.title = title or chid
         self.t_end = t_end
         self.dt = dt
+        self.time_shrink_factor: float | None = None
         self.blocks: list[str] = []
         self.used_ids: set[str] = set()
 
@@ -452,6 +457,7 @@ class FdsModel:
         xyz: list[float] | None = None,
         color: str | None = None,
         ctrl_id: str | None = None,
+        spread_rate: float | None = None,
     ) -> str:
         vent_id = vent_id or self.unique_id("vent_1")
         if mb:
@@ -480,6 +486,8 @@ class FdsModel:
             parts.append(f"COLOR='{color}'")
         if ctrl_id:
             parts.append(f"CTRL_ID='{ctrl_id}'")
+        if spread_rate is not None:
+            parts.append(f"SPREAD_RATE={fds_num(spread_rate)}")
         block = ", ".join(parts) + " /"
         return self._add(block, vent_id)
 
@@ -620,22 +628,41 @@ class FdsModel:
         tmp_ign: float | None = None,
         burn_away: bool = False,
         ctrl_id: str | None = None,
+        tau_q: float | None = None,
+        mlrpua: float | None = None,
+        mass_flux: float | None = None,
+        part_id: str | None = None,
+        default: bool = False,
+        moisture_fraction: float | None = None,
+        geometry: str | None = None,
+        length: float | None = None,
+        surface_volume_ratio: float | None = None,
     ) -> str:
         parts = [f"&SURF ID='{surf_id}'"]
         if color:
             parts.append(f"COLOR='{color}'")
         if rgb:
             parts.append(f"RGB={rgb[0]},{rgb[1]},{rgb[2]}")
+        if default:
+            parts.append("DEFAULT=.TRUE.")
         if hrrpua is not None:
             parts.append(f"HRRPUA={fds_num(hrrpua)}")
+        if mlrpua is not None:
+            parts.append(f"MLRPUA={fds_num(mlrpua)}")
+        if mass_flux is not None:
+            parts.append(f"MASS_FLUX={fds_num(mass_flux)}")
         if ramp_q:
             parts.append(f"RAMP_Q='{ramp_q}'")
+        if tau_q is not None:
+            parts.append(f"TAU_Q={fds_num(tau_q)}")
         if vel is not None:
             parts.append(f"VEL={fds_num(vel)}")
         if volume_flow is not None:
             parts.append(f"VOLUME_FLOW={fds_num(volume_flow)}")
         if tmp_front is not None:
             parts.append(f"TMP_FRONT={fds_num(tmp_front)}")
+        if part_id:
+            parts.append(f"PART_ID='{part_id}'")
         if tmp_ign is not None:
             parts.append(f"TMP_IGN={fds_num(tmp_ign)}")
         if burn_away:
@@ -658,6 +685,14 @@ class FdsModel:
             parts.append(f"BACKING='{backing}'")
         if ctrl_id:
             parts.append(f"CTRL_ID='{ctrl_id}'")
+        if moisture_fraction is not None:
+            parts.append(f"MOISTURE_FRACTION={fds_num(moisture_fraction)}")
+        if geometry:
+            parts.append(f"GEOMETRY='{geometry.upper()}'")
+        if length is not None:
+            parts.append(f"LENGTH={fds_num(length)}")
+        if surface_volume_ratio is not None:
+            parts.append(f"SURFACE_VOLUME_RATIO={fds_num(surface_volume_ratio)}")
         block = ", ".join(parts) + " /"
         return self._add(block, surf_id)
 
@@ -754,9 +789,74 @@ class FdsModel:
             return f"&PROP ID='{prop_id}' /  (already present)"
         block = (
             f"&PROP ID='{prop_id}', QUANTITY='CHAMBER OBSCURATION', "
-            f"ALPHA_E=2.5, BETA_E=-0.7, ALPHA_C=0.8, BETA_C=-0.9 /"
+            f"SMOKEVIEW_ID='smoke_detector', "
+            f"ALPHA_E=2.5, BETA_E=-0.7, ALPHA_C=0.8, BETA_C=-0.9, "
+            f"ACTIVATION_OBSCURATION=3.24 /"
         )
         return self._add(block, prop_id)
+
+    def _prop_present(self, prop_id: str) -> bool:
+        needle = f"ID='{prop_id.upper().replace(' ', '')}'"
+        return any(
+            b.strip().upper().startswith("&PROP") and needle in b.upper().replace(" ", "")
+            for b in self.blocks
+        )
+
+    def add_smoke_prop(
+        self,
+        prop_id: str,
+        *,
+        cleary: dict[str, float] | None = None,
+        length: float | None = None,
+        activation_obscuration: float | None = None,
+        smokeview_id: str = "smoke_detector",
+    ) -> str:
+        if self._prop_present(prop_id):
+            return f"&PROP ID='{prop_id}' /  (already present)"
+        parts = [
+            f"&PROP ID='{prop_id}'",
+            "QUANTITY='CHAMBER OBSCURATION'",
+            f"SMOKEVIEW_ID='{smokeview_id}'",
+        ]
+        if cleary:
+            parts.extend(
+                [
+                    f"ALPHA_E={fds_num(cleary['alpha_e'])}",
+                    f"BETA_E={fds_num(cleary['beta_e'])}",
+                    f"ALPHA_C={fds_num(cleary['alpha_c'])}",
+                    f"BETA_C={fds_num(cleary['beta_c'])}",
+                ]
+            )
+        if length is not None:
+            parts.append(f"LENGTH={fds_num(length)}")
+        if activation_obscuration is not None:
+            parts.append(f"ACTIVATION_OBSCURATION={fds_num(activation_obscuration)}")
+        block = ", ".join(parts) + " /"
+        return self._add(block, prop_id)
+
+    def add_smoke_detector(
+        self,
+        position: list[float],
+        *,
+        prop_id: str = "Cleary Ionization I1",
+        detector_id: str | None = None,
+        cleary: dict[str, float] | None = None,
+        length: float | None = None,
+        activation_obscuration: float | None = 3.24,
+        smokeview_id: str = "smoke_detector",
+    ) -> str:
+        written = [
+            self.add_smoke_prop(
+                prop_id,
+                cleary=cleary,
+                length=length,
+                activation_obscuration=activation_obscuration,
+                smokeview_id=smokeview_id,
+            )
+        ]
+        ident = detector_id or self.unique_id("SD_1")
+        written.append(self.add_devc("", position, ident, prop_id=prop_id))
+        return "\n".join(written)
 
     def add_spec(self, spec_id: str) -> str:
         compact = spec_id.upper().replace(" ", "")
@@ -854,6 +954,11 @@ class FdsModel:
         trigger_id: str | None = None,
         initial_state: bool | None = None,
         stop_fds: bool = False,
+        points: int | None = None,
+        z_id: str | None = None,
+        flowrate: float | None = None,
+        delay: float | None = None,
+        linear: bool = False,
     ) -> str:
         ident = ident or self.unique_id("TC_1")
         if ident in self.used_ids:
@@ -864,7 +969,9 @@ class FdsModel:
         if position is not None:
             parts.append(f"XYZ={format_xyz(position)}")
         if xb is not None:
-            parts.append(f"XB={format_xb(xb, planar=True)}")
+            parts.append(
+                f"XB={format_xb(xb, planar=True, linear=linear or points is not None)}"
+            )
         if statistics:
             parts.append(f"STATISTICS='{statistics}'")
         if orientation:
@@ -887,6 +994,14 @@ class FdsModel:
             parts.append(f"INITIAL_STATE={fds_bool(initial_state)}")
         if stop_fds:
             parts.append("STOP_FDS=.TRUE.")
+        if points is not None:
+            parts.append(f"POINTS={int(points)}")
+        if z_id:
+            parts.append(f"Z_ID='{z_id}'")
+        if flowrate is not None:
+            parts.append(f"FLOWRATE={fds_num(flowrate)}")
+        if delay is not None:
+            parts.append(f"DELAY={fds_num(delay)}")
         block = ", ".join(parts) + " /"
         return self._add(block, ident)
 
@@ -906,6 +1021,9 @@ class FdsModel:
         speed: float,
         direction: float = 270.0,
         z_0: float | None = None,
+        z_ref: float | None = None,
+        monin_obukhov_length: float | None = None,
+        stratification: bool | None = None,
     ) -> str:
         parts = [
             f"&WIND SPEED={fds_num(speed)}",
@@ -913,38 +1031,84 @@ class FdsModel:
         ]
         if z_0 is not None:
             parts.append(f"Z_0={fds_num(z_0)}")
+        if z_ref is not None:
+            parts.append(f"Z_REF={fds_num(z_ref)}")
+        if monin_obukhov_length is not None:
+            parts.append(f"L={fds_num(monin_obukhov_length)}")
+        if stratification is not None:
+            parts.append(f"STRATIFICATION={fds_bool(stratification)}")
         block = ", ".join(parts) + " /"
         return self._replace_group("WIND", block)
 
-    def set_time(self, t_end: float | None = None, dt: float | None = None) -> str:
+    def set_time(
+        self,
+        t_end: float | None = None,
+        dt: float | None = None,
+        time_shrink_factor: float | None = None,
+    ) -> str:
         if t_end is not None:
             self.t_end = t_end
         if dt is not None:
             self.dt = dt
+        if time_shrink_factor is not None:
+            self.time_shrink_factor = time_shrink_factor
         return self._time_line()
 
     def _time_line(self) -> str:
         parts = [f"T_END={fds_num(self.t_end)}"]
         if self.dt is not None:
             parts.append(f"DT={fds_num(self.dt)}")
+        if self.time_shrink_factor is not None:
+            parts.append(f"TIME_SHRINK_FACTOR={fds_num(self.time_shrink_factor)}")
         return "&TIME " + ", ".join(parts) + " /"
 
     def add_init(
         self,
-        bounds: list[float],
+        bounds: list[float] | None = None,
         temperature: float | None = None,
         spec_id: str | None = None,
         mass_fraction: float | None = None,
         init_id: str | None = None,
+        part_id: str | None = None,
+        n_particles: int | None = None,
+        n_particles_per_cell: int | None = None,
+        packing_ratio: float | None = None,
+        cell_centered: bool = False,
+        xyz: list[float] | None = None,
+        radius: float | None = None,
+        height: float | None = None,
+        shape: str | None = None,
     ) -> str:
         init_id = init_id or self.unique_id("init_1")
-        parts = [f"&INIT ID='{init_id}'", f"XB={format_xb(bounds)}"]
+        parts = [f"&INIT ID='{init_id}'"]
+        if bounds is not None:
+            parts.append(f"XB={format_xb(bounds)}")
+        if xyz is not None:
+            parts.append(f"XYZ={format_xyz(xyz)}")
         if temperature is not None:
             parts.append(f"TEMPERATURE={fds_num(temperature)}")
         if spec_id:
             parts.append(f"SPEC_ID='{spec_id}'")
         if mass_fraction is not None:
             parts.append(f"MASS_FRACTION={fds_num(mass_fraction)}")
+        if part_id:
+            parts.append(f"PART_ID='{part_id}'")
+        if n_particles is not None:
+            parts.append(f"N_PARTICLES={int(n_particles)}")
+        if n_particles_per_cell is not None:
+            parts.append(f"N_PARTICLES_PER_CELL={int(n_particles_per_cell)}")
+        if packing_ratio is not None:
+            parts.append(f"PACKING_RATIO={fds_num(packing_ratio)}")
+        if cell_centered:
+            parts.append("CELL_CENTERED=.TRUE.")
+        if radius is not None:
+            parts.append(f"RADIUS={fds_num(radius)}")
+        if height is not None:
+            parts.append(f"HEIGHT={fds_num(height)}")
+        if shape:
+            parts.append(f"SHAPE='{shape.upper()}'")
+        if bounds is None and xyz is None:
+            raise ValueError("INIT needs bounds (XB) or xyz")
         block = ", ".join(parts) + " /"
         return self._add(block, init_id)
 
@@ -992,6 +1156,99 @@ class FdsModel:
             f"QUANTITIES='PARTICLE DIAMETER' /"
         )
         written.append(self._add(block, part_id))
+        return "\n".join(written)
+
+    def add_line_device(
+        self,
+        quantity: str,
+        bounds: list[float],
+        ident: str,
+        points: int = 20,
+        z_id: str = "Height",
+        spec_id: str | None = None,
+    ) -> str:
+        """McCaffrey-style &DEVC XB line tree (POINTS along the tallest axis)."""
+        return self.add_devc(
+            quantity,
+            None,
+            ident,
+            xb=bounds,
+            points=points,
+            z_id=z_id,
+            spec_id=spec_id,
+        )
+
+    def add_vegetation_bed(
+        self,
+        bounds: list[float],
+        packing_ratio: float = 0.0026,
+        height: float | None = None,
+        moisture_fraction: float = 0.06,
+        surface_volume_ratio: float = 9770.0,
+        part_id: str = "blade of grass",
+        surf_id: str = "wet vegetation",
+        n_particles_per_cell: int = 1,
+        drag_coefficient: float = 2.8,
+    ) -> str:
+        """CSIRO grassland pattern: cylindrical SURF + STATIC PART + packed INIT.
+
+        https://github.com/firemodels/fds/tree/master/Validation/CSIRO_Grassland_Fires
+        """
+        written: list[str] = []
+        bed_height = float(height if height is not None else max(bounds[5] - bounds[4], 0.21))
+        if not any(
+            b.strip().upper().startswith("&MATL") and "ID='DRY GRASS'" in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            written.append(
+                self.add_matl(
+                    "DRY GRASS",
+                    conductivity=0.1,
+                    specific_heat=1.5,
+                    density=512.0,
+                    fyi="CSIRO grassland / FDS Validation vegetation fuel",
+                    n_reactions=1,
+                    heat_of_reaction=416.0,
+                    nu_fuel=0.8,
+                )
+            )
+        if surf_id not in self.used_ids:
+            written.append(
+                self.add_surf(
+                    surf_id,
+                    color="BROWN",
+                    matl_id="DRY GRASS",
+                    moisture_fraction=moisture_fraction,
+                    surface_volume_ratio=surface_volume_ratio,
+                    length=bed_height,
+                    geometry="CYLINDRICAL",
+                )
+            )
+        part_needle = f"ID='{part_id.upper().replace(' ', '')}'"
+        if not any(
+            b.strip().upper().startswith("&PART") and part_needle in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            written.append(
+                self._add(
+                    (
+                        f"&PART ID='{part_id}', SURF_ID='{surf_id}', "
+                        f"DRAG_COEFFICIENT={fds_num(drag_coefficient)}, "
+                        f"STATIC=.TRUE., SAMPLING_FACTOR=5, COLOR='BROWN', "
+                        f"QUANTITIES='PARTICLE TEMPERATURE','PARTICLE MASS' /"
+                    ),
+                    part_id,
+                )
+            )
+        written.append(
+            self.add_init(
+                bounds,
+                part_id=part_id,
+                n_particles_per_cell=n_particles_per_cell,
+                packing_ratio=packing_ratio,
+                cell_centered=True,
+            )
+        )
         return "\n".join(written)
 
     def add_sprinkler_head(
@@ -1143,24 +1400,141 @@ class FdsModel:
     def add_heat_detector(
         self,
         position: list[float],
-        activation_temperature: float = 74.0,
+        activation_temperature: float = 57.2,
         rti: float = 50.0,
         detector_id: str | None = None,
         prop_id: str = "heat_detector",
+        c_factor: float | None = None,
+        smokeview_id: str = "heat_detector",
     ) -> str:
         written: list[str] = []
-        if not any(
-            b.strip().upper().startswith("&PROP") and f"ID='{prop_id.upper()}'" in b.upper().replace(" ", "")
-            for b in self.blocks
-        ):
-            block = (
-                f"&PROP ID='{prop_id}', QUANTITY='LINK TEMPERATURE', "
-                f"ACTIVATION_TEMPERATURE={fds_num(activation_temperature)}, "
-                f"RTI={fds_num(rti)} /"
-            )
-            written.append(self._add(block, prop_id))
+        if not self._prop_present(prop_id):
+            parts = [
+                f"&PROP ID='{prop_id}'",
+                "QUANTITY='LINK TEMPERATURE'",
+                f"SMOKEVIEW_ID='{smokeview_id}'",
+                f"ACTIVATION_TEMPERATURE={fds_num(activation_temperature)}",
+                f"RTI={fds_num(rti)}",
+            ]
+            if c_factor is not None:
+                parts.append(f"C_FACTOR={fds_num(c_factor)}")
+            written.append(self._add(", ".join(parts) + " /", prop_id))
         ident = detector_id or self.unique_id("HD_1")
         written.append(self.add_devc("", position, ident, prop_id=prop_id))
+        return "\n".join(written)
+
+    def add_gas_detector(
+        self,
+        position: list[float],
+        spec_id: str,
+        setpoint: float | None = None,
+        detector_id: str | None = None,
+        prop_id: str | None = None,
+        smokeview_id: str = "sensor",
+    ) -> str:
+        written: list[str] = []
+        ident = detector_id or self.unique_id("GD_1")
+        glyph = prop_id or self.unique_id(f"{ident}_prop")
+        if not self._prop_present(glyph):
+            written.append(
+                self._add(
+                    f"&PROP ID='{glyph}', SMOKEVIEW_ID='{smokeview_id}' /",
+                    glyph,
+                )
+            )
+        written.append(
+            self.add_devc(
+                "VOLUME FRACTION",
+                position,
+                ident,
+                spec_id=spec_id,
+                setpoint=setpoint,
+                prop_id=glyph,
+            )
+        )
+        return "\n".join(written)
+
+    def add_beam_detector(
+        self,
+        start: list[float],
+        end: list[float],
+        setpoint: float | None = 15.0,
+        detector_id: str | None = None,
+    ) -> str:
+        if len(start) != 3 or len(end) != 3:
+            raise ValueError("start and end must be [x, y, z]")
+        xb = [start[0], end[0], start[1], end[1], start[2], end[2]]
+        ident = detector_id or self.unique_id("BEAM_1")
+        return self.add_devc(
+            "PATH OBSCURATION",
+            None,
+            ident,
+            xb=xb,
+            setpoint=setpoint,
+            linear=True,
+        )
+
+    def add_aspiration_detector(
+        self,
+        chamber: list[float],
+        samples: list[list[float]],
+        flowrate: float = 0.3,
+        delays: list[float] | None = None,
+        detector_id: str | None = None,
+        bypass_flowrate: float = 0.0,
+    ) -> str:
+        if not samples:
+            raise ValueError("aspiration detector needs at least one sample point")
+        ident = detector_id or self.unique_id("ASP_1")
+        written: list[str] = []
+        delay_list = list(delays) if delays is not None else [
+            50.0 * (i + 1) for i in range(len(samples))
+        ]
+        while len(delay_list) < len(samples):
+            delay_list.append(delay_list[-1] + 50.0)
+        for index, xyz in enumerate(samples):
+            written.append(
+                self.add_devc(
+                    "DENSITY",
+                    xyz,
+                    f"{ident}_sp{index + 1}",
+                    spec_id="SOOT",
+                    flowrate=flowrate,
+                    delay=delay_list[index],
+                    trigger_id=ident,
+                )
+            )
+        parts = [
+            f"&DEVC ID='{ident}'",
+            "QUANTITY='ASPIRATION'",
+            f"XYZ={format_xyz(chamber)}",
+            f"BYPASS_FLOWRATE={fds_num(bypass_flowrate)}",
+        ]
+        written.append(self._add(", ".join(parts) + " /", ident))
+        return "\n".join(written)
+
+    def add_flame_detector(
+        self,
+        position: list[float],
+        setpoint: float = 5.0,
+        orientation: list[float] | None = None,
+        detector_id: str | None = None,
+    ) -> str:
+        ident = detector_id or self.unique_id("FLAME_1")
+        prop_id = self.unique_id(f"{ident}_prop")
+        written = [
+            self._add(f"&PROP ID='{prop_id}', SMOKEVIEW_ID='target' /", prop_id)
+        ]
+        written.append(
+            self.add_devc(
+                "RADIATIVE HEAT FLUX GAS",
+                position,
+                ident,
+                setpoint=setpoint,
+                orientation=orientation or [0.0, 0.0, -1.0],
+                prop_id=prop_id,
+            )
+        )
         return "\n".join(written)
 
     def add_bndf(self, quantity: str) -> str:

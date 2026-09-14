@@ -34,13 +34,14 @@ Prompt to recreate the setup: *“Create a 5×5×3 m room and add a couch fire i
 | Fires | Couch / cigarette / car / wastebasket presets; specified HRR; HRRPUA + ignition + burn-away |
 | Chemistry | Simple `&REAC` fuels (propane, heptane, wood, PU, GM27) and \(\dot m = \mathrm{HRR}/\Delta H_c\) |
 | Materials | Engineering defaults + [UMD FireBID](http://firebid.umd.edu/material-database.php) library; layered walls |
-| Protection | NFPA 13/13D/13R/15 sprinklers (pendent, upright, sidewall, ESFR, deluge, …), smoke/heat detectors, controls |
+| Protection | NFPA 13 sprinklers; NFPA 72 smoke/heat; CO/LEL gas; beam, aspiration, flame |
 | Flow | HVAC fans, supply/exhaust VEL, leakage zones, wind, velocity patches / jet fans |
 | Tunnels | NFPA 502 critical velocity, D\*/10 mesh, pressure-solver knobs |
 | Output | Slices (PyroSim-safe geometry), isosurfaces, devices, 3D smoke |
 
 Prompt catalog: [`.cursor/05-example-prompts.md`](.cursor/05-example-prompts.md) (100 examples, beginner → advanced).  
-Thunderhead examples mapped in-tool via `pyrosim_examples_index`.
+Thunderhead examples mapped in-tool via `pyrosim_examples_index`.  
+NIST [FDS Validation](https://github.com/firemodels/fds/tree/master/Validation) (135 series) via `list_fds_validation` / `open_fds_validation`.
 
 ## Quick start
 
@@ -81,8 +82,10 @@ pyrosim-mcp/
   presets.py         t² fire presets
   materials.py       FireBID + engineering MATL
   sprinklers.py      NFPA 13 head catalog
+  detectors.py       NFPA 72 smoke/heat/gas/beam
   fire_calcs.py      stoichiometry, D*, NFPA 502
   catalog.py         slices, devices, flow notes
+  validation.py      NIST FDS Validation (135 series)
   test_fds.py
 .cursor/             tool spec + 100 sample prompts
 docs/                README images

@@ -42,11 +42,29 @@ from sprinklers import (
     resolve_sprinkler,
     resolve_temperature_rating,
 )
+from detectors import (
+    list_detector_summaries,
+    resolve_gas,
+    resolve_heat,
+    resolve_other,
+    resolve_smoke,
+)
 from presets import (
     build_cigarette_ramp,
     build_ramp,
     preset_summaries,
     resolve_preset,
+)
+from validation import (
+    CATEGORIES,
+    SERIES,
+    VALIDATION_GUIDANCE,
+    find_series_dir,
+    format_series,
+    list_case_files,
+    resolve_series,
+    search_series,
+    validation_roots,
 )
 
 mcp = FastMCP("pyrosim")
@@ -423,11 +441,13 @@ def import_fds(path: str, copy: bool = True) -> str:
 
 
 @mcp.tool()
-def list_sample_library(query: str = "") -> str:
-    """List PyroSim sample .fds files (skips fds-master verification suite).
+def list_sample_library(query: str = "", include_validation: bool = False) -> str:
+    """List PyroSim sample .fds files. Optionally include NIST FDS Validation cases.
 
     Args:
         query: Optional substring filter on file path.
+        include_validation: If true, also list fds-master/Validation FDS_Input_Files.
+            Prefer list_fds_validation() for the 135-series catalog.
     """
     root = SAMPLES_ROOT
     if not root.exists():
@@ -436,10 +456,15 @@ def list_sample_library(query: str = "") -> str:
             "Set PYROSIM_SAMPLES to your Thunderhead Samples folder."
         )
     needle = query.lower().strip()
-    lines = [f"Samples under {root} (fds-master skipped):"]
+    lines = [f"Samples under {root}:"]
     count = 0
     for path in sorted(root.rglob("*.fds")):
-        if "fds-master" in path.parts:
+        in_fds_master = "fds-master" in path.parts
+        if in_fds_master and not include_validation:
+            continue
+        if in_fds_master and "Validation" not in path.parts:
+            continue
+        if in_fds_master and "Current_Results" in path.parts:
             continue
         rel = path.relative_to(root)
         if needle and needle not in str(rel).lower():
@@ -450,6 +475,11 @@ def list_sample_library(query: str = "") -> str:
     if count > 80:
         lines.append(f"  ... {count - 80} more. Narrow with query.")
     lines.append(f"Total: {count}. Open one with open_sample(relative_path).")
+    if not include_validation:
+        lines.append(
+            f"NIST FDS Validation ({len(SERIES)} series): list_fds_validation() "
+            "or list_sample_library(include_validation=True)."
+        )
     return "\n".join(lines)
 
 
@@ -544,6 +574,9 @@ def add_surface(
     hrrpua: float | None = None,
     adiabatic: bool = False,
     leak_path: list[int] | None = None,
+    tau_q: float | None = None,
+    mlrpua: float | None = None,
+    mass_flux: float | None = None,
     fds_path: str | None = None,
 ) -> str:
     """Add a generic &SURF (flow, hot patch, adiabatic, leak path, or burner).
@@ -557,6 +590,9 @@ def add_surface(
         hrrpua: Heat release rate per unit area (kW/m²).
         adiabatic: If true, ADIABATIC=.TRUE.
         leak_path: Optional [zone_a, zone_b] for leakage surfaces.
+        tau_q: FDS TAU_Q ramp time (s). Negative grows from 0 (Validation burners).
+        mlrpua: Mass loss rate per unit area (kg/s/m²) — pool-fire Validation.
+        mass_flux: Species mass flux (kg/s/m²).
         fds_path: Model path. Defaults to the active model.
     """
     model, path = _load(fds_path)
@@ -570,6 +606,9 @@ def add_surface(
         hrrpua=hrrpua,
         adiabatic=adiabatic,
         leak_path=leak,
+        tau_q=tau_q,
+        mlrpua=mlrpua,
+        mass_flux=mass_flux,
     )
     _save(model, path)
     note = f"\n{FLOW_NOTE}" if vel is not None else ""
@@ -672,29 +711,222 @@ def add_pressure_zone(
 @mcp.tool()
 def add_smoke_detector(
     position: list[float],
+    detector_type: str = "ionization",
+    detector_id: str | None = None,
+    activation_obscuration: float | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add an NFPA 72 / FDS smoke detector (Cleary, Heskestad, or NIST Dunes 2000).
+
+    Args:
+        position: [x, y, z] in meters (typically at the ceiling).
+        detector_type: ionization, photoelectric, heskestad, cleary_i1/i2,
+            cleary_p1/p2, nist_ionization, nist_photoelectric.
+        detector_id: Optional DEVC ID.
+        activation_obscuration: Override trip point in %/m (Heskestad 3.24, photo 6.6).
+        fds_path: Model path. Defaults to the active model.
+    """
+    spec = resolve_smoke(detector_type)
+    model, path = _load(fds_path)
+    obsc = (
+        activation_obscuration
+        if activation_obscuration is not None
+        else spec.get("activation_obscuration")
+    )
+    block = model.add_smoke_detector(
+        position,
+        prop_id=model.unique_id(spec["name"]),
+        detector_id=detector_id,
+        cleary=spec.get("cleary"),
+        length=spec.get("length"),
+        activation_obscuration=obsc,
+        smokeview_id=str(spec.get("smokeview_id") or "smoke_detector"),
+    )
+    _save(model, path)
+    return (
+        f"Added {spec['name']} smoke detector in {path} ({spec['nfpa']})\n"
+        f"{block}"
+    )
+
+
+@mcp.tool()
+def add_gas_detector(
+    position: list[float],
+    gas: str = "co",
+    setpoint: float | None = None,
+    setpoint_ppm: float | None = None,
     detector_id: str | None = None,
     fds_path: str | None = None,
 ) -> str:
-    """Add a Cleary ionization smoke detector (atrium_with_fans.fds PROP + DEVC).
+    """Add a gas / species detector (VOLUME FRACTION + SPEC_ID).
 
     Args:
         position: [x, y, z] in meters.
-        detector_id: Optional device ID.
+        gas: co, co_low, co2, oxygen, fuel, methane, propane, hcn, hcl, soot.
+        setpoint: Mole-fraction trip (overrides the catalog). 70 ppm CO = 7e-5.
+        setpoint_ppm: Alternate trip in ppm (converted to mole fraction).
+        detector_id: Optional DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    spec = resolve_gas(gas)
+    if setpoint_ppm is not None:
+        trip = float(setpoint_ppm) * 1e-6
+    elif setpoint is not None:
+        trip = float(setpoint)
+    else:
+        trip = float(spec["setpoint"])
+    model, path = _load(fds_path)
+    block = model.add_gas_detector(
+        position,
+        spec["spec_id"],
+        setpoint=trip,
+        detector_id=detector_id,
+        smokeview_id=str(spec.get("smokeview_id") or "sensor"),
+    )
+    _save(model, path)
+    note = ""
+    if spec.get("falling"):
+        note = (
+            "\nNote: FDS SETPOINT trips when the quantity *rises*. "
+            "O2 is logged at 19.5 % vol; use a CTRL if you need a falling alarm."
+        )
+    return (
+        f"Added {spec['name']} gas detector in {path} ({spec['nfpa']})\n"
+        f"SPEC_ID='{spec['spec_id']}', SETPOINT={trip} ({spec['unit']})\n"
+        f"{block}{note}"
+    )
+
+
+@mcp.tool()
+def add_beam_detector(
+    start: list[float],
+    end: list[float],
+    setpoint: float = 15.0,
+    detector_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add a projected-beam smoke detector (PATH OBSCURATION).
+
+    Args:
+        start: Transmitter [x, y, z] (m).
+        end: Receiver [x, y, z] (m).
+        setpoint: Path obscuration trip in percent (FDS Verification uses a measurement;
+            15 % is a typical engineering beam alarm).
+        detector_id: Optional DEVC ID.
         fds_path: Model path. Defaults to the active model.
     """
     model, path = _load(fds_path)
-    written = [model.add_prop_cleary()]
-    ident = detector_id or model.unique_id("SD_1")
-    written.append(
-        model.add_devc(
-            "",
-            position,
-            ident,
-            prop_id="Cleary Ionization I1",
-        )
+    block = model.add_beam_detector(start, end, setpoint=setpoint, detector_id=detector_id)
+    _save(model, path)
+    return f"Added beam detector in {path} (PATH OBSCURATION, SETPOINT={setpoint} %)\n{block}"
+
+
+@mcp.tool()
+def add_aspiration_detector(
+    chamber: list[float],
+    samples: list[list[float]],
+    flowrate: float = 0.3,
+    delays: list[float] | None = None,
+    detector_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add an aspirating smoke detector (VESDA-style sampling).
+
+    Args:
+        chamber: Detector cabinet XYZ (m).
+        samples: Sampling-hole XYZ list.
+        flowrate: Per-hole FLOWRATE (default 0.3, FDS Verification).
+        delays: Optional transport DELAY (s) per hole. Default 50, 100, 150, …
+        detector_id: Optional ASPIRATION DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.add_aspiration_detector(
+        chamber,
+        samples,
+        flowrate=flowrate,
+        delays=delays,
+        detector_id=detector_id,
     )
     _save(model, path)
-    return f"Added smoke detector in {path}\n" + "\n".join(written)
+    return f"Added aspiration detector in {path} ({len(samples)} sample holes)\n{block}"
+
+
+@mcp.tool()
+def add_flame_detector(
+    position: list[float],
+    setpoint: float = 5.0,
+    orientation: list[float] | None = None,
+    detector_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add an IR/UV flame-detector analogue (RADIATIVE HEAT FLUX GAS).
+
+    Args:
+        position: [x, y, z] of the sensor (m).
+        setpoint: Trip in kW/m² (engineering default 5).
+        orientation: View direction [ox, oy, oz]. Default downward (0,0,-1).
+        detector_id: Optional DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.add_flame_detector(
+        position,
+        setpoint=setpoint,
+        orientation=orientation,
+        detector_id=detector_id,
+    )
+    _save(model, path)
+    return f"Added flame detector in {path} (SETPOINT={setpoint} kW/m²)\n{block}"
+
+
+@mcp.tool()
+def add_tenability_device(
+    detector_type: str,
+    position: list[float] | None = None,
+    xb: list[float] | None = None,
+    setpoint: float | None = None,
+    detector_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add a tenability / measurement device (visibility, optical density, thermocouple, layer height).
+
+    Args:
+        detector_type: visibility, optical_density, thermocouple, layer_height.
+        position: [x, y, z] for point devices.
+        xb: Required for layer_height (vertical column).
+        setpoint: Optional trip (visibility metres, etc.).
+        detector_id: Optional DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    spec = resolve_other(detector_type)
+    if spec["kind"] in {"beam", "aspiration", "flame"}:
+        raise ValueError(
+            f"Use add_{spec['name']}_detector for '{detector_type}'."
+        )
+    model, path = _load(fds_path)
+    ident = detector_id or model.unique_id(spec["name"][:8].upper())
+    trip = setpoint if setpoint is not None else spec.get("setpoint")
+    if spec["name"] == "layer_height":
+        if xb is None:
+            raise ValueError("layer_height needs xb as a vertical column [x,x,y,y,z0,z1]")
+        block = model.add_devc(
+            spec["quantity"], None, ident, xb=xb, setpoint=trip, linear=True
+        )
+    else:
+        if position is None:
+            raise ValueError(f"{spec['name']} needs position [x, y, z]")
+        prop_id = None
+        glyph = spec.get("smokeview_id")
+        if glyph:
+            prop_id = model.unique_id(f"{ident}_prop")
+            if not model._prop_present(prop_id):
+                model._add(f"&PROP ID='{prop_id}', SMOKEVIEW_ID='{glyph}' /", prop_id)
+        block = model.add_devc(
+            spec["quantity"], position, ident, setpoint=trip, prop_id=prop_id
+        )
+    _save(model, path)
+    return f"Added {spec['name']} in {path} ({spec['nfpa']})\n{block}"
 
 
 @mcp.tool()
@@ -786,6 +1018,10 @@ def list_catalog() -> str:
         "doors are HOLEs; mesh faces use SURF_ID='OPEN'."
     )
     lines.append("Sprinklers: list_sprinklers() for NFPA 13 pendent/upright/sidewall/ESFR/...")
+    lines.append(
+        "Detectors: list_detectors() — smoke (Cleary/Heskestad), heat (NFPA 72), "
+        "gas (CO/LEL), beam, aspiration, flame."
+    )
     return "\n".join(lines)
 
 
@@ -1227,9 +1463,10 @@ def add_hrr_fire(
     surface_id: str | None = None,
     placement: str = "vent",
     radius: float | None = None,
+    tau_q: float | None = None,
     fds_path: str | None = None,
 ) -> str:
-    """Specified-HRR fire (Thunderhead Modeling Fire / VTT heptane pattern).
+    """Specified-HRR fire (Thunderhead Modeling Fire / VTT heptane / McCaffrey pattern).
 
     Args:
         peak_hrr: Peak heat release rate in kW.
@@ -1240,7 +1477,8 @@ def add_hrr_fire(
         hrr_curve: Optional experimental [(t, kW), ...] samples (variable HRRPUA).
         surface_id: Optional &SURF ID.
         placement: 'vent' (floor burner) or 'obst'.
-        radius: Optional circular vent radius (Li/Ingason propane tunnel burner).
+        radius: Optional circular vent radius (Li/Ingason / NIST pool fires).
+        tau_q: If set, use FDS TAU_Q instead of an explicit RAMP (Validation burners).
         fds_path: Model path. Defaults to the active model.
     """
     if area <= 0 or peak_hrr <= 0:
@@ -1261,9 +1499,14 @@ def add_hrr_fire(
     else:
         ramp = [(0.0, 0.0), (1.0, 1.0), (max(model.t_end, 10.0), 1.0)]
     hrrpua = peak_hrr / area
-    written.append(
-        model.add_surf_with_ramp(surf_id, hrrpua, ramp_id, ramp, color="RED")
-    )
+    if tau_q is not None and not hrr_curve and not growth_rate:
+        written.append(
+            model.add_surf(surf_id, hrrpua=hrrpua, tau_q=tau_q, color="RED", tmp_front=100.0)
+        )
+    else:
+        written.append(
+            model.add_surf_with_ramp(surf_id, hrrpua, ramp_id, ramp, color="RED")
+        )
     x, y, z = position
     if radius is not None:
         xb = [x - radius, x + radius, y - radius, y + radius, z, z]
@@ -1422,18 +1665,28 @@ def set_wind(
     speed: float,
     direction: float = 270.0,
     z_0: float | None = None,
+    z_ref: float | None = None,
+    monin_obukhov_length: float | None = None,
     fds_path: str | None = None,
 ) -> str:
-    """Add &WIND (Simple Wind in PyroSim how-to). DIRECTION is meteorological degrees.
+    """Add &WIND (Simple Wind / CSIRO grassland Validation). DIRECTION is meteorological degrees.
 
     Args:
         speed: Wind speed (m/s).
         direction: Direction the wind comes FROM, degrees (270 = west wind, +X).
-        z_0: Optional aerodynamic roughness length (m).
+        z_0: Optional aerodynamic roughness length (m). CSIRO grassland uses 0.03 m.
+        z_ref: Optional reference height (m) for SPEED.
+        monin_obukhov_length: Optional Monin–Obukhov L (m). CSIRO uses L=-500.
         fds_path: Model path. Defaults to the active model.
     """
     model, path = _load(fds_path)
-    block = model.set_wind(speed, direction=direction, z_0=z_0)
+    block = model.set_wind(
+        speed,
+        direction=direction,
+        z_0=z_0,
+        z_ref=z_ref,
+        monin_obukhov_length=monin_obukhov_length,
+    )
     _save(model, path)
     return f"Updated WIND in {path}\n{block}"
 
@@ -1488,6 +1741,20 @@ def add_control(
         f"Added control in {path}\n{block}\n"
         "Attach it with ctrl_id on add_vent / add_obstruction (INITIAL_STATE for doors)."
     )
+
+
+@mcp.tool()
+def list_detectors() -> str:
+    """NFPA 72 / FDS smoke, heat, gas, beam, aspiration, and flame detector presets."""
+    lines = [
+        "FDS detector catalog (PROP + DEVC). Glyphs: smoke_detector, heat_detector, sensor, target.",
+        "https://github.com/firemodels/fds/tree/master/Verification/Detectors",
+        "NIST Smoke Alarms: open_fds_validation('NIST_Smoke_Alarms').",
+        *list_detector_summaries(),
+        "Heat ratings (NFPA 72): ordinary 57.2°C, intermediate 79.4, high 121, extra_high 163.",
+        "CO default 70 ppm (UL 2034 / NFPA 720). Gas SETPOINT is mole fraction.",
+    ]
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1567,29 +1834,202 @@ def add_sprinkler(
 @mcp.tool()
 def add_heat_detector(
     position: list[float],
-    activation_temperature: float = 74.0,
-    rti: float = 50.0,
+    detector_type: str = "ordinary",
+    activation_temperature: float | None = None,
+    rti: float | None = None,
     detector_id: str | None = None,
     fds_path: str | None = None,
 ) -> str:
-    """Add a heat detector (NFPA 72-style link; FDS QUANTITY='LINK TEMPERATURE').
+    """Add an NFPA 72 spot heat detector (FDS QUANTITY='LINK TEMPERATURE').
 
     Args:
         position: [x, y, z] in meters.
-        activation_temperature: °C (ordinary 68.33, intermediate 93, high 141).
-        rti: (m·s)^0.5. Fast ≈ 50, standard ≈ 148.
+        detector_type: ordinary (135 °F / 57 °C), intermediate, high, extra_high,
+            rate_compensation, rate_of_rise, combination, fds_example (74 °C).
+        activation_temperature: Override °C.
+        rti: Override RTI (m·s)^0.5. Fast ≈ 50, standard ≈ 148.
         detector_id: Optional DEVC ID.
         fds_path: Model path. Defaults to the active model.
     """
+    spec = resolve_heat(detector_type)
+    t_act = float(
+        activation_temperature if activation_temperature is not None else spec["activation_temperature"]
+    )
+    rti_val = float(rti if rti is not None else spec["rti"])
     model, path = _load(fds_path)
     block = model.add_heat_detector(
         position,
-        activation_temperature=activation_temperature,
-        rti=rti,
+        activation_temperature=t_act,
+        rti=rti_val,
         detector_id=detector_id,
+        prop_id=model.unique_id(spec["name"]),
+        c_factor=spec.get("c_factor") or None,
+        smokeview_id=str(spec.get("smokeview_id") or "heat_detector"),
     )
     _save(model, path)
-    return f"Added heat detector in {path}\n{block}"
+    return (
+        f"Added {spec['name']} heat detector in {path} ({spec['nfpa']})\n"
+        f"T={t_act}°C, RTI={rti_val}, SMOKEVIEW_ID={spec.get('smokeview_id')}\n"
+        f"{block}"
+    )
+
+
+@mcp.tool()
+def list_fds_validation(query: str = "", category: str = "") -> str:
+    """List NIST FDS Validation series (firemodels/fds Validation/).
+
+    Args:
+        query: Filter on series id, title, or summary (e.g. tunnel, McCaffrey, sprinkler).
+        category: Optional category: plume, compartment, ceiling_jet, vegetation,
+            tunnel, suppression, burning_rate, pyrolysis, wind, jet_lng, heat_flux,
+            velocity, species, pressure, structure, aerosol, flow, materials, scaling.
+    """
+    rows = search_series(query, category)
+    cats = ", ".join(CATEGORIES)
+    lines = [
+        f"NIST FDS Validation — {len(SERIES)} series on GitHub.",
+        "https://github.com/firemodels/fds/tree/master/Validation",
+        f"Categories: {cats}",
+        f"Showing {len(rows)} match(es). Open with open_fds_validation(series, case).",
+        "",
+    ]
+    roots = validation_roots(SAMPLES_ROOT)
+    local_note = f"Local Validation roots: {', '.join(str(p) for p in roots)}" if roots else (
+        "No local Validation tree. Set PYROSIM_SAMPLES (…/fds-master) or FDS_VALIDATION."
+    )
+    lines.append(local_note)
+    cap = 40 if query or category else 25
+    for row in rows[:cap]:
+        local = find_series_dir(row["id"], SAMPLES_ROOT)
+        n_cases = len(list_case_files(row["id"], SAMPLES_ROOT)) if local else None
+        lines.append("")
+        lines.append(format_series(row, local=local, n_cases=n_cases))
+    if len(rows) > cap:
+        lines.append(f"\n… {len(rows) - cap} more. Narrow query or category.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def open_fds_validation(series: str, case: str | None = None) -> str:
+    """Open a NIST FDS Validation input file as the active model (copied into models/).
+
+    Args:
+        series: Validation folder name, e.g. McCaffrey_Plume, Steckler_Compartment,
+            CSIRO_Grassland_Fires, Memorial_Tunnel.
+        case: Optional .fds file name (or unique substring). Omit to list cases.
+    """
+    row = resolve_series(series)
+    files = list_case_files(row["id"], SAMPLES_ROOT)
+    if not files:
+        local = find_series_dir(row["id"], SAMPLES_ROOT)
+        return (
+            f"{format_series(row, local=local)}\n"
+            "No local FDS_Input_Files found. Clone firemodels/fds or point "
+            "PYROSIM_SAMPLES at a tree that contains fds-master/Validation."
+        )
+    if not case:
+        lines = [
+            format_series(row, local=find_series_dir(row["id"], SAMPLES_ROOT), n_cases=len(files)),
+            "Cases:",
+        ]
+        for path in files[:80]:
+            lines.append(f"  {path.name}")
+        if len(files) > 80:
+            lines.append(f"  … {len(files) - 80} more.")
+        lines.append("Re-call with case='the_file.fds' to import a copy.")
+        return "\n".join(lines)
+    needle = case.lower().replace("\\", "/")
+    matches = [
+        path for path in files
+        if needle in path.name.lower() or needle in str(path).lower().replace("\\", "/")
+    ]
+    if not matches:
+        names = ", ".join(p.name for p in files[:12])
+        raise FileNotFoundError(
+            f"No case matching '{case}' in {row['id']}. Examples: {names}"
+        )
+    if len(matches) > 1 and not any(p.name.lower() == case.lower() for p in matches):
+        listed = "\n".join(f"  {p.name}" for p in matches[:20])
+        return f"Multiple matches for '{case}':\n{listed}\nPass the exact file name."
+    chosen = next((p for p in matches if p.name.lower() == case.lower()), matches[0])
+    imported = import_fds(str(chosen), copy=True)
+    return f"Opened Validation case {row['id']}/{chosen.name}\n{row['github']}\n{imported}"
+
+
+@mcp.tool()
+def fds_validation_guidance(topic: str = "") -> str:
+    """How to reuse NIST FDS Validation cases (ASTM E1355 / SP 1018-3).
+
+    Args:
+        topic: Optional keyword (plume, tunnel, sprinkler, vegetation, pool, wind, …)
+            to list matching series plus the tool mapping.
+    """
+    if not topic.strip():
+        return VALIDATION_GUIDANCE
+    rows = search_series(topic)
+    lines = [VALIDATION_GUIDANCE, "", f"Matches for '{topic}': {len(rows)}"]
+    for row in rows[:20]:
+        lines.append(f"- {row['id']}: {row['summary']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_line_device(
+    quantity: str,
+    bounds: list[float],
+    points: int = 20,
+    device_id: str | None = None,
+    z_id: str = "Height",
+    fds_path: str | None = None,
+) -> str:
+    """Add a McCaffrey-style line of devices (&DEVC XB + POINTS).
+
+    Args:
+        quantity: THERMOCOUPLE, W-VELOCITY, TEMPERATURE, VOLUME FRACTION, …
+        bounds: Line XB [x0,x1,y0,y1,z0,z1] (typically a vertical line).
+        points: Number of samples along the line.
+        device_id: Optional DEVC ID.
+        z_id: Coordinate label written to the _line.csv (McCaffrey uses Height).
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    ident = device_id or model.unique_id("line_1")
+    block = model.add_line_device(quantity, bounds, ident, points=points, z_id=z_id)
+    _save(model, path)
+    return f"Added line device in {path}\n{block}"
+
+
+@mcp.tool()
+def add_vegetation_bed(
+    bounds: list[float],
+    packing_ratio: float = 0.0026,
+    moisture_fraction: float = 0.06,
+    height: float | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add a CSIRO-style packed vegetation bed (STATIC PART + INIT packing).
+
+    Args:
+        bounds: Fuel-bed XB [x0,x1,y0,y1,z0,z1] in meters.
+        packing_ratio: Solid volume fraction (CSIRO C064 uses 0.0026).
+        moisture_fraction: Dry-basis moisture on the vegetation SURF.
+        height: Particle length / bed height (m). Default = Δz of bounds.
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    if not any(b.strip().upper().startswith("&REAC") for b in model.blocks):
+        _apply_fuel(model, "CELLULOSE")
+    block = model.add_vegetation_bed(
+        bounds,
+        packing_ratio=packing_ratio,
+        height=height,
+        moisture_fraction=moisture_fraction,
+    )
+    _save(model, path)
+    return (
+        f"Added vegetation bed in {path} (CSIRO grassland Validation pattern)\n"
+        f"{block}"
+    )
 
 
 @mcp.tool()
@@ -1602,7 +2042,7 @@ https://www.thunderheadeng.com/docs/2026-1/pyrosim/examples/
 Fundamentals
 - Materials and Layered Surfaces → list_materials, add_material, add_layered_surface
   http://firebid.umd.edu/material-database.php
-- Fire Protection Systems and Controls → add_sprinkler, add_control, add_smoke_detector, add_heat_detector
+- Fire Protection Systems and Controls → list_detectors, add_sprinkler, add_smoke_detector, add_heat_detector, add_gas_detector, add_beam_detector, add_control
 - Basic Data Output → create_2d_slice, add_device, show_smoke
 - Fire Design Scenarios / How-to Scenarios → new_model + add_hrr_fire per case
 
@@ -1623,10 +2063,17 @@ How-to
 
 NFPA references in presets
 - NFPA 13 / 13D / 13R / 15 sprinklers (list_sprinklers)
-- NFPA 72 heat-detector RTI classes (add_heat_detector)
+- NFPA 72 smoke / heat / CO (list_detectors, add_smoke_detector, add_heat_detector, add_gas_detector)
 - NFPA 92/92B-style t² growth (add_fire_preset / add_hrr_fire growth_rate)
 - NFPA 502 critical velocity (nfpa_502_critical_velocity)
-"""
+
+NIST FDS Validation (firemodels/fds Validation/) — {n} series
+- list_fds_validation(query, category) / open_fds_validation(series, case)
+- fds_validation_guidance()
+- McCaffrey line trees → add_line_device; CSIRO grass → add_vegetation_bed, set_wind(L, z_0)
+- Steckler door holes → add_hole; pool fires → add_hrr_fire(radius=...); TAU_Q → add_hrr_fire(tau_q=)
+- https://github.com/firemodels/fds/tree/master/Validation
+""".format(n=len(SERIES))
 
 
 def main() -> None:
