@@ -11,6 +11,7 @@ _ID_RE = re.compile(r"\bID\s*=\s*'([^']+)'", re.IGNORECASE)
 _HEAD_CHID_RE = re.compile(r"\bCHID\s*=\s*'([^']+)'", re.IGNORECASE)
 _HEAD_TITLE_RE = re.compile(r"\bTITLE\s*=\s*'([^']+)'", re.IGNORECASE)
 _T_END_RE = re.compile(r"\bT_END\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", re.IGNORECASE)
+_DT_RE = re.compile(r"\bDT\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)", re.IGNORECASE)
 _XB_ASSIGN_RE = re.compile(r"\bXB\s*=\s*([^/]+)", re.IGNORECASE)
 _SLCF_PLANE_RE = re.compile(r"\bPB[XYZ]\s*=", re.IGNORECASE)
 
@@ -42,6 +43,20 @@ def fds_num(value: float) -> str:
 
 def fds_bool(value: bool) -> str:
     return ".TRUE." if value else ".FALSE."
+
+
+def fds_fyi(text: str | None) -> str | None:
+    """FYI strings cannot contain '/' (namelist terminator) or unescaped quotes."""
+    if not text:
+        return None
+    cleaned = (
+        str(text)
+        .replace("/", " - ")
+        .replace("'", "")
+        .replace("\n", " ")
+        .strip()
+    )
+    return cleaned[:120] or None
 
 
 def format_xb(bounds: list[float] | tuple[float, ...], *, planar: bool = False) -> str:
@@ -138,10 +153,11 @@ def validate_fds_text(text: str) -> list[str]:
 class FdsModel:
     """In-memory FDS model: namelist blocks plus a used-ID registry."""
 
-    def __init__(self, chid: str, title: str = "", t_end: float = 600.0):
+    def __init__(self, chid: str, title: str = "", t_end: float = 600.0, dt: float | None = None):
         self.chid = chid
         self.title = title or chid
         self.t_end = t_end
+        self.dt = dt
         self.blocks: list[str] = []
         self.used_ids: set[str] = set()
 
@@ -197,25 +213,55 @@ class FdsModel:
         reac_id: str,
         hcn_yield: float | None = 0.0,
         heat_of_combustion: float | None = 25300.0,
+        radiative_fraction: float | None = None,
+        formula: str | None = None,
+        c: float | None = None,
+        h: float | None = None,
+        o: float | None = None,
+        n: float | None = None,
+        fyi: str | None = None,
+        critical_flame_temperature: float | None = None,
+        needs_spec: bool = False,
+        hcl_yield: float | None = None,
     ) -> tuple[str | None, str]:
         """Return optional &SPEC block and &REAC block for fuel chemistry."""
-        formula = self.FUEL_FORMULAS.get(fuel.upper())
+        formula = formula or self.FUEL_FORMULAS.get(fuel.upper())
         spec_block = None
-        if formula:
+        if formula and (needs_spec or fuel.upper() in self.FUEL_FORMULAS):
             parts = [f"&SPEC ID='{fuel}', FORMULA='{formula}'"]
             cp = self.FUEL_SPECIFIC_HEAT.get(fuel.upper())
             if cp is not None:
                 parts.append(f", SPECIFIC_HEAT={fds_num(cp)}")
             spec_block = "".join(parts) + " /"
-        reac_parts = [
-            f"&REAC ID='{reac_id}', FUEL='{fuel}', "
-            f"SOOT_YIELD={fds_num(soot_yield)}, CO_YIELD={fds_num(co_yield)}"
-        ]
+        reac_parts = [f"&REAC ID='{reac_id}'"]
+        if fyi:
+            cleaned = fds_fyi(fyi)
+            if cleaned:
+                reac_parts.append(f"FYI='{cleaned}'")
+        reac_parts.append(f"FUEL='{fuel}'")
+        if c is not None:
+            reac_parts.append(f"C={fds_num(c)}")
+        if h is not None:
+            reac_parts.append(f"H={fds_num(h)}")
+        if o is not None:
+            reac_parts.append(f"O={fds_num(o)}")
+        if n is not None:
+            reac_parts.append(f"N={fds_num(n)}")
+        reac_parts.append(f"SOOT_YIELD={fds_num(soot_yield)}")
+        reac_parts.append(f"CO_YIELD={fds_num(co_yield)}")
         if hcn_yield is not None:
-            reac_parts.append(f", HCN_YIELD={fds_num(hcn_yield)}")
-        if heat_of_combustion is not None and fuel.upper() in self.FUEL_FORMULAS:
-            reac_parts.append(f", HEAT_OF_COMBUSTION={fds_num(heat_of_combustion)}")
-        reac_block = "".join(reac_parts) + " /"
+            reac_parts.append(f"HCN_YIELD={fds_num(hcn_yield)}")
+        if hcl_yield is not None:
+            reac_parts.append(f"HCL_YIELD={fds_num(hcl_yield)}")
+        if heat_of_combustion is not None:
+            reac_parts.append(f"HEAT_OF_COMBUSTION={fds_num(heat_of_combustion)}")
+        if radiative_fraction is not None:
+            reac_parts.append(f"RADIATIVE_FRACTION={fds_num(radiative_fraction)}")
+        if critical_flame_temperature is not None:
+            reac_parts.append(
+                f"CRITICAL_FLAME_TEMPERATURE={fds_num(critical_flame_temperature)}"
+            )
+        reac_block = ", ".join(reac_parts) + " /"
         return spec_block, reac_block
 
     def add_reac(
@@ -226,12 +272,22 @@ class FdsModel:
         reac_id: str | None = None,
         hcn_yield: float | None = 0.0,
         heat_of_combustion: float | None = 25300.0,
+        radiative_fraction: float | None = None,
+        formula: str | None = None,
+        c: float | None = None,
+        h: float | None = None,
+        o: float | None = None,
+        n: float | None = None,
+        fyi: str | None = None,
+        critical_flame_temperature: float | None = None,
+        needs_spec: bool = False,
+        hcl_yield: float | None = None,
     ) -> str:
         if any(b.strip().upper().startswith("&REAC") for b in self.blocks):
             raise ValueError("A &REAC group is already present")
-        needs_spec = fuel.upper() in self.FUEL_FORMULAS
+        use_spec = needs_spec or fuel.upper() in self.FUEL_FORMULAS or bool(formula)
         # SPEC and REAC both use ID=; keep them distinct in our ID registry.
-        reac_id = reac_id or (f"{fuel}_RXN" if needs_spec else fuel)
+        reac_id = reac_id or (f"{fuel}_RXN" if use_spec else fuel)
         spec_block, reac_block = self._reac_text(
             fuel,
             soot_yield,
@@ -239,6 +295,16 @@ class FdsModel:
             reac_id,
             hcn_yield=hcn_yield,
             heat_of_combustion=heat_of_combustion,
+            radiative_fraction=radiative_fraction,
+            formula=formula,
+            c=c,
+            h=h,
+            o=o,
+            n=n,
+            fyi=fyi,
+            critical_flame_temperature=critical_flame_temperature,
+            needs_spec=use_spec,
+            hcl_yield=hcl_yield,
         )
         written: list[str] = []
         if spec_block and not any(
@@ -257,10 +323,20 @@ class FdsModel:
         reac_id: str | None = None,
         hcn_yield: float | None = 0.0,
         heat_of_combustion: float | None = 25300.0,
+        radiative_fraction: float | None = None,
+        formula: str | None = None,
+        c: float | None = None,
+        h: float | None = None,
+        o: float | None = None,
+        n: float | None = None,
+        fyi: str | None = None,
+        critical_flame_temperature: float | None = None,
+        needs_spec: bool = False,
+        hcl_yield: float | None = None,
     ) -> str:
         """Add or replace the model's single &REAC group (and fuel &SPEC if needed)."""
-        needs_spec = fuel.upper() in self.FUEL_FORMULAS
-        reac_id = reac_id or (f"{fuel}_RXN" if needs_spec else fuel)
+        use_spec = needs_spec or fuel.upper() in self.FUEL_FORMULAS or bool(formula)
+        reac_id = reac_id or (f"{fuel}_RXN" if use_spec else fuel)
         spec_block, reac_block = self._reac_text(
             fuel,
             soot_yield,
@@ -268,6 +344,16 @@ class FdsModel:
             reac_id,
             hcn_yield=hcn_yield,
             heat_of_combustion=heat_of_combustion,
+            radiative_fraction=radiative_fraction,
+            formula=formula,
+            c=c,
+            h=h,
+            o=o,
+            n=n,
+            fyi=fyi,
+            critical_flame_temperature=critical_flame_temperature,
+            needs_spec=use_spec,
+            hcl_yield=hcl_yield,
         )
         kept: list[str] = []
         for existing in self.blocks:
@@ -276,7 +362,7 @@ class FdsModel:
                 self.used_ids -= extract_ids(existing)
                 continue
             if (
-                needs_spec
+                use_spec
                 and upper.startswith("&SPEC")
                 and f"ID='{fuel.upper()}'" in upper.replace('"', "'")
             ):
@@ -297,6 +383,10 @@ class FdsModel:
         ramp_id: str,
         ramp_points: list[tuple[float, float]],
         color: str = "RED",
+        tmp_ign: float | None = None,
+        burn_away: bool = False,
+        matl_id: str | None = None,
+        thickness: float | None = None,
     ) -> str:
         if not ramp_points:
             raise ValueError("ramp_points must contain at least one (t, f) pair")
@@ -306,10 +396,21 @@ class FdsModel:
             f"&RAMP ID='{ramp_id}', T={fds_num(t)}, F={fds_num(f)} /"
             for t, f in ramp_points
         ]
-        lines.append(
-            f"&SURF ID='{surf_id}', HRRPUA={fds_num(hrrpua)}, "
-            f"RAMP_Q='{ramp_id}', COLOR='{color}' /"
-        )
+        parts = [
+            f"&SURF ID='{surf_id}'",
+            f"HRRPUA={fds_num(hrrpua)}",
+            f"RAMP_Q='{ramp_id}'",
+            f"COLOR='{color}'",
+        ]
+        if tmp_ign is not None:
+            parts.append(f"TMP_IGN={fds_num(tmp_ign)}")
+        if burn_away:
+            parts.append("BURN_AWAY=.TRUE.")
+        if matl_id:
+            parts.append(f"MATL_ID='{matl_id}'")
+        if thickness is not None:
+            parts.append(f"THICKNESS={fds_num(thickness)}")
+        lines.append(", ".join(parts) + " /")
         block = "\n".join(lines)
         self.blocks.append(block)
         return block
@@ -320,6 +421,9 @@ class FdsModel:
         obst_id: str | None = None,
         surf_id: str | None = None,
         surf_ids: tuple[str, str, str] | None = None,
+        burn_away: bool = False,
+        ctrl_id: str | None = None,
+        initial_state: bool | None = None,
     ) -> str:
         obst_id = obst_id or self.unique_id("obst_1")
         parts = [f"&OBST XB={format_xb(bounds)}"]
@@ -328,20 +432,55 @@ class FdsModel:
             parts.append(f"SURF_IDS='{top}','{sides}','{bottom}'")
         elif surf_id:
             parts.append(f"SURF_ID='{surf_id}'")
+        if burn_away:
+            parts.append("BURN_AWAY=.TRUE.")
+        if ctrl_id:
+            parts.append(f"CTRL_ID='{ctrl_id}'")
+        if initial_state is not None:
+            parts.append(f"INITIAL_STATE={fds_bool(initial_state)}")
         parts.append(f"ID='{obst_id}' /")
         block = ", ".join(parts[:-1]) + f", {parts[-1]}"
         return self._add(block, obst_id)
 
     def add_vent(
         self,
-        bounds: list[float],
+        bounds: list[float] | None,
         surface_id: str,
         vent_id: str | None = None,
+        mb: str | None = None,
+        radius: float | None = None,
+        xyz: list[float] | None = None,
+        color: str | None = None,
+        ctrl_id: str | None = None,
     ) -> str:
         vent_id = vent_id or self.unique_id("vent_1")
-        block = (
-            f"&VENT XB={format_xb(bounds, planar=True)}, SURF_ID='{surface_id}', ID='{vent_id}' /"
-        )
+        if mb:
+            face = mb.upper()
+            allowed = {"XMIN", "XMAX", "YMIN", "YMAX", "ZMIN", "ZMAX"}
+            if face not in allowed:
+                raise ValueError(f"mb must be one of {sorted(allowed)}")
+            parts = [
+                f"&VENT ID='{vent_id}'",
+                f"MB='{face}'",
+                f"SURF_ID='{surface_id}'",
+            ]
+        else:
+            if bounds is None:
+                raise ValueError("VENT needs bounds or mb")
+            parts = [
+                f"&VENT ID='{vent_id}'",
+                f"XB={format_xb(bounds, planar=True)}",
+                f"SURF_ID='{surface_id}'",
+            ]
+        if radius is not None:
+            parts.append(f"RADIUS={fds_num(radius)}")
+        if xyz is not None:
+            parts.append(f"XYZ={format_xyz(xyz)}")
+        if color:
+            parts.append(f"COLOR='{color}'")
+        if ctrl_id:
+            parts.append(f"CTRL_ID='{ctrl_id}'")
+        block = ", ".join(parts) + " /"
         return self._add(block, vent_id)
 
     def _replace_group(self, group: str, block: str) -> str:
@@ -387,10 +526,23 @@ class FdsModel:
             block = "&DUMP " + ", ".join(parts) + " /"
         return self._replace_group("DUMP", block)
 
-    def set_misc(self, tmpa: float | None = None, extra: dict[str, str] | None = None) -> str:
+    def set_misc(
+        self,
+        tmpa: float | None = None,
+        humidity: float | None = None,
+        simulation_mode: str | None = None,
+        p_inf: float | None = None,
+        extra: dict[str, str] | None = None,
+    ) -> str:
         parts = ["&MISC"]
         if tmpa is not None:
             parts.append(f"TMPA={fds_num(tmpa)}")
+        if humidity is not None:
+            parts.append(f"HUMIDITY={fds_num(humidity)}")
+        if simulation_mode:
+            parts.append(f"SIMULATION_MODE='{simulation_mode}'")
+        if p_inf is not None:
+            parts.append(f"P_INF={fds_num(p_inf)}")
         if extra:
             for key, value in extra.items():
                 parts.append(f"{key}={value}")
@@ -409,15 +561,43 @@ class FdsModel:
         specific_heat: float,
         density: float,
         emissivity: float | None = None,
+        fyi: str | None = None,
+        heat_of_combustion: float | None = None,
+        heat_of_reaction: float | None = None,
+        n_reactions: int | None = None,
+        reference_temperature: float | None = None,
+        nu_fuel: float | None = None,
     ) -> str:
-        parts = [
-            f"&MATL ID='{matl_id}'",
-            f"CONDUCTIVITY={fds_num(conductivity)}",
-            f"SPECIFIC_HEAT={fds_num(specific_heat)}",
-            f"DENSITY={fds_num(density)}",
-        ]
+        needle = f"ID='{matl_id.upper()}'"
+        if any(
+            b.strip().upper().startswith("&MATL") and needle in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            return f"&MATL ID='{matl_id}' /  (already present)"
+        parts = [f"&MATL ID='{matl_id}'"]
+        if fyi:
+            cleaned = fds_fyi(fyi)
+            if cleaned:
+                parts.append(f"FYI='{cleaned}'")
+        parts.extend(
+            [
+                f"CONDUCTIVITY={fds_num(conductivity)}",
+                f"SPECIFIC_HEAT={fds_num(specific_heat)}",
+                f"DENSITY={fds_num(density)}",
+            ]
+        )
         if emissivity is not None:
             parts.append(f"EMISSIVITY={fds_num(emissivity)}")
+        if heat_of_combustion is not None:
+            parts.append(f"HEAT_OF_COMBUSTION={fds_num(heat_of_combustion)}")
+        if n_reactions is not None:
+            parts.append(f"N_REACTIONS={int(n_reactions)}")
+        if reference_temperature is not None:
+            parts.append(f"REFERENCE_TEMPERATURE={fds_num(reference_temperature)}")
+        if heat_of_reaction is not None:
+            parts.append(f"HEAT_OF_REACTION={fds_num(heat_of_reaction)}")
+        if nu_fuel is not None:
+            parts.append(f"NU_FUEL={fds_num(nu_fuel)}")
         block = ", ".join(parts) + " /"
         return self._add(block, matl_id)
 
@@ -431,12 +611,15 @@ class FdsModel:
         vel: float | None = None,
         volume_flow: float | None = None,
         tmp_front: float | None = None,
-        matl_id: str | None = None,
-        thickness: float | None = None,
+        matl_id: str | list[str] | tuple[str, ...] | None = None,
+        thickness: float | list[float] | tuple[float, ...] | None = None,
         adiabatic: bool = False,
         leak_path: tuple[int, int] | None = None,
         backing: str | None = None,
         ramp_q: str | None = None,
+        tmp_ign: float | None = None,
+        burn_away: bool = False,
+        ctrl_id: str | None = None,
     ) -> str:
         parts = [f"&SURF ID='{surf_id}'"]
         if color:
@@ -453,16 +636,28 @@ class FdsModel:
             parts.append(f"VOLUME_FLOW={fds_num(volume_flow)}")
         if tmp_front is not None:
             parts.append(f"TMP_FRONT={fds_num(tmp_front)}")
+        if tmp_ign is not None:
+            parts.append(f"TMP_IGN={fds_num(tmp_ign)}")
+        if burn_away:
+            parts.append("BURN_AWAY=.TRUE.")
         if matl_id:
-            parts.append(f"MATL_ID='{matl_id}'")
+            if isinstance(matl_id, (list, tuple)):
+                parts.append("MATL_ID=" + ",".join(f"'{item}'" for item in matl_id))
+            else:
+                parts.append(f"MATL_ID='{matl_id}'")
         if thickness is not None:
-            parts.append(f"THICKNESS={fds_num(thickness)}")
+            if isinstance(thickness, (list, tuple)):
+                parts.append("THICKNESS=" + ",".join(fds_num(v) for v in thickness))
+            else:
+                parts.append(f"THICKNESS={fds_num(thickness)}")
         if adiabatic:
             parts.append("ADIABATIC=.TRUE.")
         if leak_path is not None:
             parts.append(f"LEAK_PATH={leak_path[0]},{leak_path[1]}")
         if backing:
             parts.append(f"BACKING='{backing}'")
+        if ctrl_id:
+            parts.append(f"CTRL_ID='{ctrl_id}'")
         block = ", ".join(parts) + " /"
         return self._add(block, surf_id)
 
@@ -471,16 +666,14 @@ class FdsModel:
         faces: list[str] | None = None,
         skip_floor: bool = True,
     ) -> str:
-        """OPEN vents on mesh-domain faces. Face names: xmin xmax ymin ymax zmin zmax."""
-        xb = self.domain_xb()
-        x0, x1, y0, y1, z0, z1 = xb
+        """OPEN vents on mesh faces. Uses NIST FDS MB='XMIN' style (activate_sprinklers.fds)."""
         catalog = {
-            "xmin": [x0, x0, y0, y1, z0, z1],
-            "xmax": [x1, x1, y0, y1, z0, z1],
-            "ymin": [x0, x1, y0, y0, z0, z1],
-            "ymax": [x0, x1, y1, y1, z0, z1],
-            "zmin": [x0, x1, y0, y1, z0, z0],
-            "zmax": [x0, x1, y0, y1, z1, z1],
+            "xmin": "XMIN",
+            "xmax": "XMAX",
+            "ymin": "YMIN",
+            "ymax": "YMAX",
+            "zmin": "ZMIN",
+            "zmax": "ZMAX",
         }
         chosen = [f.lower() for f in (faces or list(catalog))]
         if skip_floor and faces is None:
@@ -491,7 +684,7 @@ class FdsModel:
         written: list[str] = []
         for name in chosen:
             vent_id = self.unique_id(f"open_{name}")
-            written.append(self.add_vent(catalog[name], "OPEN", vent_id=vent_id))
+            written.append(self.add_vent(None, "OPEN", vent_id=vent_id, mb=catalog[name]))
         return "\n".join(written)
 
     def add_zone(
@@ -566,9 +759,10 @@ class FdsModel:
         return self._add(block, prop_id)
 
     def add_spec(self, spec_id: str) -> str:
-        needle = f"ID='{spec_id.upper()}'"
+        compact = spec_id.upper().replace(" ", "")
         if any(
-            b.strip().upper().startswith("&SPEC") and needle in b.upper().replace(" ", "")
+            b.strip().upper().startswith("&SPEC")
+            and f"ID='{compact}'" in b.upper().replace(" ", "")
             for b in self.blocks
         ):
             return f"&SPEC ID='{spec_id}' /  (already present)"
@@ -605,10 +799,13 @@ class FdsModel:
         xb: list[float] | None = None,
         vector: bool = False,
         spec_id: str | None = None,
+        part_id: str | None = None,
     ) -> str:
         parts = [f"&SLCF QUANTITY='{quantity}'"]
         if spec_id:
             parts.append(f"SPEC_ID='{spec_id}'")
+        if part_id:
+            parts.append(f"PART_ID='{part_id}'")
         if axis is not None:
             axis = axis.lower()
             if axis not in {"x", "y", "z"}:
@@ -651,6 +848,12 @@ class FdsModel:
         orientation: list[float] | None = None,
         spec_id: str | None = None,
         prop_id: str | None = None,
+        setpoint: float | None = None,
+        part_id: str | None = None,
+        ctrl_id: str | None = None,
+        trigger_id: str | None = None,
+        initial_state: bool | None = None,
+        stop_fds: bool = False,
     ) -> str:
         ident = ident or self.unique_id("TC_1")
         if ident in self.used_ids:
@@ -672,8 +875,293 @@ class FdsModel:
             parts.append(f"SPEC_ID='{spec_id}'")
         if prop_id:
             parts.append(f"PROP_ID='{prop_id}'")
+        if part_id:
+            parts.append(f"PART_ID='{part_id}'")
+        if setpoint is not None:
+            parts.append(f"SETPOINT={fds_num(setpoint)}")
+        if ctrl_id:
+            parts.append(f"CTRL_ID='{ctrl_id}'")
+        if trigger_id:
+            parts.append(f"DEVC_ID='{trigger_id}'")
+        if initial_state is not None:
+            parts.append(f"INITIAL_STATE={fds_bool(initial_state)}")
+        if stop_fds:
+            parts.append("STOP_FDS=.TRUE.")
         block = ", ".join(parts) + " /"
         return self._add(block, ident)
+
+    def set_radi(
+        self,
+        radiation: bool = True,
+        number_radiation_angles: int | None = None,
+    ) -> str:
+        parts = [f"&RADI RADIATION={fds_bool(radiation)}"]
+        if number_radiation_angles is not None:
+            parts.append(f"NUMBER_RADIATION_ANGLES={int(number_radiation_angles)}")
+        block = ", ".join(parts) + " /"
+        return self._replace_group("RADI", block)
+
+    def set_wind(
+        self,
+        speed: float,
+        direction: float = 270.0,
+        z_0: float | None = None,
+    ) -> str:
+        parts = [
+            f"&WIND SPEED={fds_num(speed)}",
+            f"DIRECTION={fds_num(direction)}",
+        ]
+        if z_0 is not None:
+            parts.append(f"Z_0={fds_num(z_0)}")
+        block = ", ".join(parts) + " /"
+        return self._replace_group("WIND", block)
+
+    def set_time(self, t_end: float | None = None, dt: float | None = None) -> str:
+        if t_end is not None:
+            self.t_end = t_end
+        if dt is not None:
+            self.dt = dt
+        return self._time_line()
+
+    def _time_line(self) -> str:
+        parts = [f"T_END={fds_num(self.t_end)}"]
+        if self.dt is not None:
+            parts.append(f"DT={fds_num(self.dt)}")
+        return "&TIME " + ", ".join(parts) + " /"
+
+    def add_init(
+        self,
+        bounds: list[float],
+        temperature: float | None = None,
+        spec_id: str | None = None,
+        mass_fraction: float | None = None,
+        init_id: str | None = None,
+    ) -> str:
+        init_id = init_id or self.unique_id("init_1")
+        parts = [f"&INIT ID='{init_id}'", f"XB={format_xb(bounds)}"]
+        if temperature is not None:
+            parts.append(f"TEMPERATURE={fds_num(temperature)}")
+        if spec_id:
+            parts.append(f"SPEC_ID='{spec_id}'")
+        if mass_fraction is not None:
+            parts.append(f"MASS_FRACTION={fds_num(mass_fraction)}")
+        block = ", ".join(parts) + " /"
+        return self._add(block, init_id)
+
+    def add_ctrl(
+        self,
+        ctrl_id: str,
+        function_type: str,
+        input_ids: list[str],
+        latch: bool = True,
+        delay: float | None = None,
+    ) -> str:
+        if not input_ids:
+            raise ValueError("CTRL needs at least one INPUT_ID")
+        inputs = ",".join(f"'{item}'" for item in input_ids)
+        parts = [
+            f"&CTRL ID='{ctrl_id}'",
+            f"FUNCTION_TYPE='{function_type.upper()}'",
+            f"INPUT_ID={inputs}",
+            f"LATCH={fds_bool(latch)}",
+        ]
+        if delay is not None:
+            parts.append(f"DELAY={fds_num(delay)}")
+        block = ", ".join(parts) + " /"
+        return self._add(block, ctrl_id)
+
+    def add_water_particles(
+        self,
+        part_id: str = "water drops",
+        diameter: float = 750.0,
+    ) -> str:
+        written: list[str] = []
+        spec_line = self.add_spec("WATER VAPOR")
+        if "already present" not in spec_line:
+            written.append(spec_line)
+        needle = f"ID='{part_id.upper().replace(' ', '')}'"
+        if any(
+            b.strip().upper().startswith("&PART") and needle in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            written.append(f"&PART ID='{part_id}' /  (already present)")
+            return "\n".join(written)
+        block = (
+            f"&PART ID='{part_id}', SPEC_ID='WATER VAPOR', "
+            f"DIAMETER={fds_num(diameter)}, SAMPLING_FACTOR=1, "
+            f"QUANTITIES='PARTICLE DIAMETER' /"
+        )
+        written.append(self._add(block, part_id))
+        return "\n".join(written)
+
+    def add_sprinkler_head(
+        self,
+        position: list[float],
+        flow_rate: float = 80.0,
+        activation_temperature: float = 74.0,
+        rti: float = 148.0,
+        particle_velocity: float = 10.0,
+        spray_angle: tuple[float, float] | list[float] = (30.0, 80.0),
+        offset: float = 0.10,
+        diameter: float = 750.0,
+        prop_id: str | None = None,
+        sprinkler_id: str | None = None,
+        part_id: str = "water drops",
+        smokeview_id: str = "sprinkler_upright",
+        orientation: list[float] | None = None,
+        open_head: bool = False,
+        c_factor: float | None = None,
+        ctrl_id: str | None = None,
+    ) -> str:
+        """NIST sprinkler: PART water drops + PROP SPRINKLER LINK TEMPERATURE + DEVC.
+
+        Pattern from Verification/Sprinklers_and_Sprays/bucket_test_1.fds.
+        FLOW_RATE is L/min. RTI is (m·s)^0.5. Activation temperature is °C.
+        Open/deluge heads use a TIME device (SETPOINT=0) instead of a fusible link.
+        """
+        written = [self.add_water_particles(part_id=part_id, diameter=diameter)]
+        prop_id = prop_id or self.unique_id("sprinkler")
+        if not any(
+            b.strip().upper().startswith("&PROP")
+            and f"ID='{prop_id.upper()}'" in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            parts = [
+                f"&PROP ID='{prop_id}'",
+                "QUANTITY='SPRINKLER LINK TEMPERATURE'",
+                f"OFFSET={fds_num(offset)}",
+                f"PART_ID='{part_id}'",
+                f"FLOW_RATE={fds_num(flow_rate)}",
+                f"PARTICLE_VELOCITY={fds_num(particle_velocity)}",
+                f"SPRAY_ANGLE={fds_num(spray_angle[0])},{fds_num(spray_angle[1])}",
+                f"SMOKEVIEW_ID='{smokeview_id}'",
+            ]
+            if not open_head:
+                parts.append(f"ACTIVATION_TEMPERATURE={fds_num(activation_temperature)}")
+                parts.append(f"RTI={fds_num(rti)}")
+            if c_factor is not None:
+                parts.append(f"C_FACTOR={fds_num(c_factor)}")
+            written.append(self._add(", ".join(parts) + " /", prop_id))
+        ident = sprinkler_id or self.unique_id("Spr_1")
+        if open_head:
+            written.append(
+                self.add_devc(
+                    "TIME",
+                    position,
+                    ident,
+                    prop_id=prop_id,
+                    setpoint=0.0,
+                    orientation=orientation,
+                    ctrl_id=ctrl_id,
+                )
+            )
+        else:
+            written.append(
+                self.add_devc(
+                    "",
+                    position,
+                    ident,
+                    prop_id=prop_id,
+                    orientation=orientation,
+                    ctrl_id=ctrl_id,
+                )
+            )
+        return "\n".join(written)
+
+    def add_velocity_patch(
+        self,
+        bounds: list[float],
+        velocity: float,
+        component: int | str = 1,
+        prop_id: str | None = None,
+        patch_id: str | None = None,
+        clock_id: str = "jet_patch_clock",
+    ) -> str:
+        """FDS VELOCITY PATCH (jet-fan / sprinkler-entrainment tutorial).
+
+        component: 1/2/3 or x/y/z. P0 is the signed axial velocity (m/s).
+        """
+        axis = str(component).strip().lower()
+        component_map = {"x": 1, "y": 2, "z": 3, "1": 1, "2": 2, "3": 3}
+        if axis not in component_map:
+            raise ValueError("component must be 1/2/3 or x/y/z")
+        index = component_map[axis]
+        prop_id = prop_id or self.unique_id(f"vpatch_{'xyz'[index - 1]}")
+        written: list[str] = []
+        if not any(
+            b.strip().upper().startswith("&PROP")
+            and f"ID='{prop_id.upper()}'" in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            written.append(
+                self._add(
+                    (
+                        f"&PROP ID='{prop_id}', VELOCITY_COMPONENT={index}, "
+                        f"P0={fds_num(velocity)} /"
+                    ),
+                    prop_id,
+                )
+            )
+        if not any(
+            b.strip().upper().startswith("&DEVC")
+            and f"ID='{clock_id.upper()}'" in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            written.append(
+                self.add_devc("TIME", [0.0, 0.0, 0.0], clock_id, setpoint=0.0)
+            )
+        patch_id = patch_id or self.unique_id("velocity_patch")
+        written.append(
+            self.add_devc(
+                "VELOCITY PATCH",
+                None,
+                patch_id,
+                xb=bounds,
+                prop_id=prop_id,
+                trigger_id=clock_id,
+            )
+        )
+        return "\n".join(written)
+
+    def set_pres(
+        self,
+        pressure_tolerance: float | None = None,
+        max_pressure_iterations: int | None = None,
+    ) -> str:
+        """&PRES for long tunnels (FDS User Guide §6.6.2 / Thunderhead tutorial)."""
+        parts = ["&PRES"]
+        if pressure_tolerance is not None:
+            parts.append(f"PRESSURE_TOLERANCE={fds_num(pressure_tolerance)}")
+        if max_pressure_iterations is not None:
+            parts.append(f"MAX_PRESSURE_ITERATIONS={int(max_pressure_iterations)}")
+        if len(parts) == 1:
+            block = "&PRES /"
+        else:
+            block = ", ".join(parts) + " /"
+        return self._replace_group("PRES", block)
+
+    def add_heat_detector(
+        self,
+        position: list[float],
+        activation_temperature: float = 74.0,
+        rti: float = 50.0,
+        detector_id: str | None = None,
+        prop_id: str = "heat_detector",
+    ) -> str:
+        written: list[str] = []
+        if not any(
+            b.strip().upper().startswith("&PROP") and f"ID='{prop_id.upper()}'" in b.upper().replace(" ", "")
+            for b in self.blocks
+        ):
+            block = (
+                f"&PROP ID='{prop_id}', QUANTITY='LINK TEMPERATURE', "
+                f"ACTIVATION_TEMPERATURE={fds_num(activation_temperature)}, "
+                f"RTI={fds_num(rti)} /"
+            )
+            written.append(self._add(block, prop_id))
+        ident = detector_id or self.unique_id("HD_1")
+        written.append(self.add_devc("", position, ident, prop_id=prop_id))
+        return "\n".join(written)
 
     def add_bndf(self, quantity: str) -> str:
         block = f"&BNDF QUANTITY='{quantity}' /"
@@ -683,7 +1171,7 @@ class FdsModel:
     def to_fds(self) -> str:
         lines = [
             f"&HEAD CHID='{self.chid}', TITLE='{self.title}' /",
-            f"&TIME T_END={fds_num(self.t_end)} /",
+            self._time_line(),
             *self.blocks,
             "&TAIL /",
         ]
@@ -711,7 +1199,10 @@ class FdsModel:
         for block in self.blocks:
             stripped = block.strip()
             upper = stripped.upper()
-            if upper.startswith(("&MESH", "&OBST", "&VENT", "&SURF", "&REAC", "&HOLE", "&MATL", "&HVAC", "&ZONE")):
+            if upper.startswith((
+                "&MESH", "&OBST", "&VENT", "&SURF", "&REAC", "&HOLE", "&MATL",
+                "&HVAC", "&ZONE", "&PART", "&PROP", "&CTRL", "&WIND", "&RADI", "&INIT",
+            )):
                 summaries.append(stripped.split("\n")[0])
         return summaries
 

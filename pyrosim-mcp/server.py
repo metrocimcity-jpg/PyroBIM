@@ -24,6 +24,24 @@ from catalog import (
     MATERIALS,
     SLICE_QUANTITIES,
 )
+from fire_calcs import (
+    FIRE_MODELING_GUIDANCE,
+    FUELS,
+    characteristic_fire_diameter,
+    fuel_mass_from_hrr,
+    hrrpua_from_hrr,
+    nfpa_502_critical_velocity as calc_nfpa_502,
+    ramp_from_hrr_curve,
+    recommended_cell_size,
+    resolve_fuel,
+)
+from materials import resolve_material, list_materials as material_rows, MATERIAL_CATEGORIES
+from sprinklers import (
+    flow_lpm,
+    list_sprinkler_summaries,
+    resolve_sprinkler,
+    resolve_temperature_rating,
+)
 from presets import (
     build_cigarette_ramp,
     build_ramp,
@@ -477,37 +495,43 @@ def add_material(
     """Add a &MATL plus matching solid &SURF from the PyroSim material catalog.
 
     Args:
-        name: CONCRETE, CONCRETE_LIGHT, STEEL, GYPSUM, or GLASS.
+        name: Catalog ID or FireBID name, e.g. CONCRETE, STEEL, Oak, Nylon, AISI 304.
         surf_id: Optional SURF ID (defaults to the material name).
         thickness: Override default thickness in meters.
         fds_path: Model path. Defaults to the active model.
     """
-    key = name.strip().upper()
-    if key not in MATERIALS:
-        raise ValueError(f"Unknown material '{name}'. Available: {', '.join(MATERIALS)}")
-    spec = MATERIALS[key]
+    spec = resolve_material(name)
+    if spec.get("conductivity") is None or spec.get("density") is None or spec.get("specific_heat") is None:
+        raise ValueError(
+            f"Material '{name}' is incomplete in FireBID (missing k, ρ, or cp). "
+            "Pick a sibling with full thermal properties from list_materials()."
+        )
     model, path = _load(fds_path)
+    matl_id = spec["id"]
     written = [
         model.add_matl(
-            key,
+            matl_id,
             conductivity=float(spec["conductivity"]),
             specific_heat=float(spec["specific_heat"]),
             density=float(spec["density"]),
             emissivity=spec.get("emissivity"),
+            fyi=str(spec.get("description") or "")[:80] or None,
         )
     ]
-    surf_name = surf_id or f"{key}_SURF"
+    surf_name = surf_id or f"{matl_id}_SURF"
     written.append(
         model.add_surf(
             surf_name,
             color=spec.get("color"),
-            matl_id=key,
+            matl_id=matl_id,
             thickness=float(thickness if thickness is not None else spec["thickness"]),
             backing="VOID",
         )
     )
     _save(model, path)
-    return f"Added material {key} in {path}\n" + "\n".join(written)
+    note = spec.get("note")
+    extra = f"\nNote: {note}" if note else ""
+    return f"Added material {matl_id} ({spec['name']}) in {path}\n" + "\n".join(written) + extra
 
 
 @mcp.tool()
@@ -737,13 +761,22 @@ def inspect_model(fds_path: str | None = None) -> str:
 @mcp.tool()
 def list_catalog() -> str:
     """Materials, slice quantities, and device quantities seen in the PyroSim sample library."""
-    lines = ["Materials:"]
-    for name, spec in MATERIALS.items():
+    lines = ["Materials (engineering + UMD FireBID / PyroSim materials tutorial):"]
+    for spec in MATERIALS.values():
+        if spec.get("category") != "engineering":
+            continue
         lines.append(
-            f"  {name}: k={spec['conductivity']} W/m/K, "
+            f"  {spec['id']}: k={spec['conductivity']} W/m/K, "
             f"cp={spec['specific_heat']} kJ/kg/K, rho={spec['density']} kg/m³, "
-            f"t={spec['thickness']} m — {spec['description']}"
+            f"t={spec['thickness']} m — {spec.get('description', '')}"
         )
+    lines.append(
+        "Full FireBID categories: "
+        + ", ".join(MATERIAL_CATEGORIES)
+        + ". Call list_materials(category) for the screenshot library "
+        "(plastics, metals, hardwood, softwood, misc_wood, misc)."
+    )
+    lines.append("Simple-chemistry fuels: " + ", ".join(FUELS))
     lines.append("Common SLCF quantities: " + ", ".join(SLICE_QUANTITIES))
     lines.append("Common DEVC quantities: " + ", ".join(DEVICE_QUANTITIES))
     lines.append(FLOW_NOTE)
@@ -752,6 +785,7 @@ def list_catalog() -> str:
         "velocity slices use VECTOR=.TRUE.; fires are often floor VENTs; "
         "doors are HOLEs; mesh faces use SURF_ID='OPEN'."
     )
+    lines.append("Sprinklers: list_sprinklers() for NFPA 13 pendent/upright/sidewall/ESFR/...")
     return "\n".join(lines)
 
 
@@ -995,6 +1029,604 @@ def open_smokeview(fds_path: str | None = None) -> str:
             "Set SMOKEVIEW_EXE to the full path of smokeview.exe."
         )
     return f"Launched Smokeview: {exe} {target}"
+
+
+def _apply_fuel(model: FdsModel, fuel_name: str) -> str | None:
+    spec = resolve_fuel(fuel_name)
+    kwargs = dict(
+        fuel=spec["fuel"],
+        soot_yield=float(spec.get("soot_yield", 0.01)),
+        co_yield=float(spec.get("co_yield", 0.0)),
+        heat_of_combustion=spec.get("heat_of_combustion"),
+        radiative_fraction=spec.get("radiative_fraction"),
+        formula=spec.get("formula") if spec.get("needs_spec") else None,
+        c=spec.get("c"),
+        h=spec.get("h"),
+        o=spec.get("o"),
+        n=spec.get("n"),
+        fyi=spec.get("description"),
+        critical_flame_temperature=spec.get("critical_flame_temperature"),
+        needs_spec=bool(spec.get("needs_spec")),
+    )
+    if any(b.strip().upper().startswith("&REAC") for b in model.blocks):
+        return None
+    return model.add_reac(**kwargs)
+
+
+@mcp.tool()
+def list_materials(category: str = "") -> str:
+    """List solid-material presets (PyroSim engineering library + UMD FireBID table).
+
+    Args:
+        category: engineering, plastics, metals, hardwood, softwood, misc_wood, misc, wood.
+            Empty lists every category.
+    """
+    rows = material_rows(category or None)
+    lines = [
+        "UMD FireBID / PyroSim materials tutorial. Starting-point values, not a standard library.",
+        "http://firebid.umd.edu/material-database.php",
+        f"Category filter: {category or 'all'} ({len(rows)} entries)",
+    ]
+    for spec in rows:
+        tig = f", Tig={spec['tmp_ign']}°C" if spec.get("tmp_ign") is not None else ""
+        lg = f", Lg={spec['heat_of_gasification']} MJ/kg" if spec.get("heat_of_gasification") else ""
+        lines.append(
+            f"- {spec['id']} ({spec['name']}, {spec['category']}): "
+            f"k={spec['conductivity']} W/m/K, ρ={spec['density']} kg/m³, "
+            f"cp={spec['specific_heat']} kJ/kg/K{tig}{lg}. {spec.get('source', '')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_layered_surface(
+    surf_id: str,
+    materials: list[str],
+    thicknesses: list[float],
+    color: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Layered &SURF (PyroSim gypsum / insulation / gypsum wall tutorial).
+
+    Args:
+        surf_id: Surface ID.
+        materials: Catalog names in outside-to-inside order, e.g. [GYPSUM, INSULATION, GYPSUM].
+        thicknesses: Layer thicknesses in meters, same length as materials.
+        color: Optional named color.
+        fds_path: Model path. Defaults to the active model.
+    """
+    if len(materials) != len(thicknesses) or not materials:
+        raise ValueError("materials and thicknesses must be non-empty and the same length")
+    model, path = _load(fds_path)
+    written: list[str] = []
+    ids: list[str] = []
+    for name in materials:
+        spec = resolve_material(name)
+        ids.append(spec["id"])
+        written.append(
+            model.add_matl(
+                spec["id"],
+                conductivity=float(spec["conductivity"]),
+                specific_heat=float(spec["specific_heat"]),
+                density=float(spec["density"]),
+                emissivity=spec.get("emissivity"),
+                fyi=str(spec.get("description") or "")[:80] or None,
+            )
+        )
+    written.append(
+        model.add_surf(
+            surf_id,
+            color=color or "WHITE",
+            matl_id=ids,
+            thickness=list(thicknesses),
+            backing="VOID",
+        )
+    )
+    _save(model, path)
+    return f"Added layered surface in {path}\n" + "\n".join(written)
+
+
+@mcp.tool()
+def list_fuels() -> str:
+    """Simple-chemistry fuels for &REAC (Modeling Fire in PyroSim tutorial)."""
+    lines = [
+        "FDS simple chemistry: C,H,O,N fuel + O2 → H2O, CO2, soot, CO, N2 (mixing-controlled).",
+        "https://www.thunderheadeng.com/docs/2026-1/pyrosim/examples/applications/modeling-fire/",
+    ]
+    for spec in FUELS.values():
+        lines.append(
+            f"- {spec['fuel']}: ΔHc={spec.get('heat_of_combustion')} kJ/kg, "
+            f"soot={spec.get('soot_yield')}, CO={spec.get('co_yield')}. {spec.get('description')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_reaction(
+    fuel: str = "PROPANE",
+    soot_yield: float | None = None,
+    co_yield: float | None = None,
+    hcn_yield: float | None = None,
+    hcl_yield: float | None = None,
+    radiative_fraction: float | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add or replace the model's &REAC simple-chemistry reaction.
+
+    Args:
+        fuel: PROPANE, N-HEPTANE, METHANE, POLYURETHANE, POLYURETHANE_GM27, WOOD.
+        soot_yield: Override catalog soot yield.
+        co_yield: Override catalog CO yield.
+        hcn_yield: Optional HCN yield (combustion calculator tutorial).
+        hcl_yield: Optional HCl yield.
+        radiative_fraction: Override catalog χ_r.
+        fds_path: Model path. Defaults to the active model.
+    """
+    spec = resolve_fuel(fuel)
+    model, path = _load(fds_path)
+    block = model.set_reac(
+        fuel=spec["fuel"],
+        soot_yield=float(soot_yield if soot_yield is not None else spec.get("soot_yield", 0.01)),
+        co_yield=float(co_yield if co_yield is not None else spec.get("co_yield", 0.0)),
+        heat_of_combustion=spec.get("heat_of_combustion"),
+        radiative_fraction=(
+            radiative_fraction
+            if radiative_fraction is not None
+            else spec.get("radiative_fraction")
+        ),
+        formula=spec.get("formula") if spec.get("needs_spec") else None,
+        c=spec.get("c"),
+        h=spec.get("h"),
+        o=spec.get("o"),
+        n=spec.get("n"),
+        fyi=spec.get("description"),
+        critical_flame_temperature=spec.get("critical_flame_temperature"),
+        needs_spec=bool(spec.get("needs_spec")),
+        hcn_yield=hcn_yield if hcn_yield is not None else 0.0,
+        hcl_yield=hcl_yield,
+    )
+    _save(model, path)
+    return f"Set reaction in {path}\n{block}"
+
+
+@mcp.tool()
+def fire_stoichiometry(
+    hrr_kw: float,
+    area_m2: float = 1.0,
+    fuel: str = "N-HEPTANE",
+    heat_of_combustion: float | None = None,
+    tmpa_c: float = 20.0,
+) -> str:
+    """Convert specified HRR to fuel mass flow (Modeling Fire tutorial).
+
+    m_dot = HRR / ΔHc. FDS injects that fuel so combustion matches the requested HRR.
+    Also reports D* and a D*/10 mesh suggestion (NFPA 502 tunnel tutorial).
+    """
+    spec = resolve_fuel(fuel)
+    hoc = float(heat_of_combustion if heat_of_combustion is not None else spec["heat_of_combustion"])
+    mdot = fuel_mass_from_hrr(hrr_kw, hoc)
+    hrrpua = hrrpua_from_hrr(hrr_kw, area_m2)
+    mesh = recommended_cell_size(hrr_kw, tmpa_c=tmpa_c)
+    return (
+        f"Fuel {spec['fuel']}, ΔHc={hoc} kJ/kg\n"
+        f"HRR={hrr_kw} kW over {area_m2} m² → HRRPUA={hrrpua:.4g} kW/m²\n"
+        f"Fuel mass flow m_dot={mdot:.6g} kg/s "
+        f"({mdot / area_m2:.6g} kg/s/m²)\n"
+        f"D*={mesh['d_star_m']:.4g} m; recommended dx≈D*/10={mesh['dx_m']:.4g} m"
+    )
+
+
+@mcp.tool()
+def add_hrr_fire(
+    peak_hrr: float,
+    area: float,
+    position: list[float],
+    fuel: str = "N-HEPTANE",
+    growth_rate: str | None = None,
+    hrr_curve: list[list[float]] | None = None,
+    surface_id: str | None = None,
+    placement: str = "vent",
+    radius: float | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Specified-HRR fire (Thunderhead Modeling Fire / VTT heptane pattern).
+
+    Args:
+        peak_hrr: Peak heat release rate in kW.
+        area: Fuel area in m² (square unless radius is set).
+        position: Min-corner [x, y, z] or circle center if radius is set.
+        fuel: Simple-chemistry fuel preset.
+        growth_rate: Optional NFPA t² class: slow, medium, fast, ultra-fast.
+        hrr_curve: Optional experimental [(t, kW), ...] samples (variable HRRPUA).
+        surface_id: Optional &SURF ID.
+        placement: 'vent' (floor burner) or 'obst'.
+        radius: Optional circular vent radius (Li/Ingason propane tunnel burner).
+        fds_path: Model path. Defaults to the active model.
+    """
+    if area <= 0 or peak_hrr <= 0:
+        raise ValueError("peak_hrr and area must be positive")
+    model, path = _load(fds_path)
+    written: list[str] = []
+    reac = _apply_fuel(model, fuel)
+    if reac:
+        written.append(reac)
+    surf_id = surface_id or model.unique_id("hrr_fire")
+    ramp_id = model.unique_id(f"{surf_id}_ramp")
+    if hrr_curve:
+        pairs = [(float(row[0]), float(row[1])) for row in hrr_curve]
+        peak, ramp = ramp_from_hrr_curve(pairs)
+        peak_hrr = peak
+    elif growth_rate:
+        ramp = build_ramp(growth_rate, peak_hrr)
+    else:
+        ramp = [(0.0, 0.0), (1.0, 1.0), (max(model.t_end, 10.0), 1.0)]
+    hrrpua = peak_hrr / area
+    written.append(
+        model.add_surf_with_ramp(surf_id, hrrpua, ramp_id, ramp, color="RED")
+    )
+    x, y, z = position
+    if radius is not None:
+        xb = [x - radius, x + radius, y - radius, y + radius, z, z]
+        written.append(
+            model.add_vent(xb, surf_id, radius=radius, xyz=[x, y, z], color="RED")
+        )
+    elif placement == "vent":
+        side = area ** 0.5
+        written.append(
+            model.add_vent([x, x + side, y, y + side, z, z], surf_id)
+        )
+    else:
+        side = area ** 0.5
+        written.append(
+            model.add_obst(
+                [x, x + side, y, y + side, z, z + 0.2],
+                surf_ids=(surf_id, "INERT", "INERT"),
+            )
+        )
+    _save(model, path)
+    mdot = fuel_mass_from_hrr(peak_hrr, float(resolve_fuel(fuel)["heat_of_combustion"]))
+    return (
+        f"Added HRR fire in {path} (peak {peak_hrr} kW, HRRPUA={hrrpua:.4g} kW/m², "
+        f"m_dot={mdot:.4g} kg/s)\n" + "\n".join(written)
+    )
+
+
+@mcp.tool()
+def add_hrrpua_fire(
+    hrrpua: float,
+    bounds: list[float],
+    fuel: str = "WOOD",
+    tmp_ign: float | None = 300.0,
+    burn_away: bool = True,
+    material: str = "Softwood",
+    thickness: float = 0.05,
+    surface_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """HRRPUA + TMP_IGN + BURN_AWAY fire (Modeling Fire tutorial part 4).
+
+    Args:
+        hrrpua: kW/m².
+        bounds: Burner OBST [x0, x1, y0, y1, z0, z1].
+        fuel: Simple-chemistry fuel.
+        tmp_ign: Ignition temperature °C. None skips TMP_IGN.
+        burn_away: If true, the obstruction is consumed.
+        material: Catalog material for the solid (needed for burn-away mass).
+        thickness: Solid thickness in meters.
+        surface_id: Optional SURF ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    written: list[str] = []
+    reac = _apply_fuel(model, fuel)
+    if reac:
+        written.append(reac)
+    spec = resolve_material(material)
+    written.append(
+        model.add_matl(
+            spec["id"],
+            conductivity=float(spec["conductivity"]),
+            specific_heat=float(spec["specific_heat"]),
+            density=float(spec["density"]),
+            emissivity=spec.get("emissivity"),
+        )
+    )
+    surf_id = surface_id or model.unique_id("hrrpua_fire")
+    written.append(
+        model.add_surf(
+            surf_id,
+            color="ORANGE",
+            hrrpua=hrrpua,
+            tmp_ign=tmp_ign,
+            burn_away=burn_away,
+            matl_id=spec["id"],
+            thickness=thickness,
+        )
+    )
+    written.append(
+        model.add_obst(bounds, surf_id=surf_id, burn_away=burn_away)
+    )
+    _save(model, path)
+    return f"Added HRRPUA fire in {path}\n" + "\n".join(written)
+
+
+@mcp.tool()
+def fire_modeling_guidance() -> str:
+    """Thunderhead Modeling Fire + materials + NFPA 502 notes for FDS input."""
+    return FIRE_MODELING_GUIDANCE
+
+
+@mcp.tool()
+def nfpa_502_critical_velocity(
+    hrr_kw: float,
+    height_m: float,
+    area_m2: float,
+    grade_percent: float = 0.0,
+    tmpa_c: float = 20.0,
+) -> str:
+    """Iterate NFPA 502 critical velocity (2017 equations; 2020 Annex D keeps the same pair).
+
+    Args:
+        hrr_kw: Fire heat release rate (kW).
+        height_m: Tunnel height H (m).
+        area_m2: Tunnel cross-section A (m²).
+        grade_percent: Grade in percent. Kg ≈ 1 + 0.0374 |G|^0.8 (level = 0).
+        tmpa_c: Approach-air temperature °C.
+    """
+    grade_factor = 1.0
+    if abs(grade_percent) > 1e-9:
+        grade_factor = 1.0 + 0.0374 * (abs(grade_percent) ** 0.8)
+    result = calc_nfpa_502(
+        hrr_kw,
+        height_m,
+        area_m2,
+        grade_factor=grade_factor,
+        tmpa_c=tmpa_c,
+    )
+    mesh = recommended_cell_size(hrr_kw, tmpa_c=tmpa_c)
+    return (
+        f"NFPA 502 critical velocity\n"
+        f"https://www.thunderheadeng.com/docs/2026-1/pyrosim/examples/applications/critical-velocity-tunnel/\n"
+        f"V_c={result['v_c_m_s']:.4g} m/s, T_f={result['t_f_c']:.4g} °C "
+        f"(K1={result['k1']}, Kg={grade_factor:.4g} for {grade_percent}% grade)\n"
+        f"D*={mesh['d_star_m']:.4g} m, suggested fire-mesh dx={mesh['dx_m']:.4g} m (D*/10)\n"
+        "Long tunnels: set_pressure_solver(max_pressure_iterations=50) and tighten "
+        "PRESSURE_TOLERANCE (FDS User Guide §6.6.2)."
+    )
+
+
+@mcp.tool()
+def set_pressure_solver(
+    pressure_tolerance: float | None = None,
+    max_pressure_iterations: int = 50,
+    fds_path: str | None = None,
+) -> str:
+    """Set &PRES for long tunnels (Thunderhead critical-velocity tutorial).
+
+    Args:
+        pressure_tolerance: Optional PRESSURE_TOLERANCE. Default FDS is 20/δx².
+        max_pressure_iterations: Default 50 (tutorial used 50 vs FDS default 10).
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.set_pres(
+        pressure_tolerance=pressure_tolerance,
+        max_pressure_iterations=max_pressure_iterations,
+    )
+    _save(model, path)
+    return f"Updated PRES in {path}\n{block}"
+
+
+@mcp.tool()
+def set_wind(
+    speed: float,
+    direction: float = 270.0,
+    z_0: float | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add &WIND (Simple Wind in PyroSim how-to). DIRECTION is meteorological degrees.
+
+    Args:
+        speed: Wind speed (m/s).
+        direction: Direction the wind comes FROM, degrees (270 = west wind, +X).
+        z_0: Optional aerodynamic roughness length (m).
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.set_wind(speed, direction=direction, z_0=z_0)
+    _save(model, path)
+    return f"Updated WIND in {path}\n{block}"
+
+
+@mcp.tool()
+def add_velocity_patch(
+    bounds: list[float],
+    velocity: float,
+    component: str = "x",
+    fds_path: str | None = None,
+) -> str:
+    """Specify gas velocity in a volume (Velocity Patch in FDS / jet-fan tutorial).
+
+    Args:
+        bounds: Patch XB [x0, x1, y0, y1, z0, z1].
+        velocity: Signed P0 (m/s). Negative often used for −X car-park fans.
+        component: x, y, or z (VELOCITY_COMPONENT 1/2/3).
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.add_velocity_patch(bounds, velocity, component=component)
+    _save(model, path)
+    return f"Added velocity patch in {path}\n{block}"
+
+
+@mcp.tool()
+def add_control(
+    ctrl_id: str,
+    detector_id: str,
+    delay: float = 0.0,
+    function_type: str = "ANY",
+    fds_path: str | None = None,
+) -> str:
+    """Activation control (Fire Protection Systems tutorial: exhaust 30 s after detector).
+
+    Args:
+        ctrl_id: Control ID.
+        detector_id: INPUT_ID of the triggering DEVC (smoke detector, sprinkler, ...).
+        delay: Seconds after the detector before the control fires.
+        function_type: FDS FUNCTION_TYPE (ANY is typical for one detector).
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.add_ctrl(
+        ctrl_id,
+        function_type,
+        [detector_id],
+        delay=delay if delay else None,
+    )
+    _save(model, path)
+    return (
+        f"Added control in {path}\n{block}\n"
+        "Attach it with ctrl_id on add_vent / add_obstruction (INITIAL_STATE for doors)."
+    )
+
+
+@mcp.tool()
+def list_sprinklers() -> str:
+    """NFPA 13 / 13D / 13R / 15 sprinkler types mapped to FDS PROP + Smokeview glyphs."""
+    lines = [
+        "NFPA 13 sprinkler presets (K*sqrt(P) -> L/min). Smokeview glyphs: "
+        "sprinkler_pendent, sprinkler_upright, nozzle. Sidewall uses pendent + ORIENTATION.",
+        "PyroSim Generic Commercial Link = 68.33 °C (155 °F ordinary).",
+        "https://www.thunderheadeng.com/docs/2026-1/pyrosim/examples/fundamentals/5-fire-protection-systems/",
+        *list_sprinkler_summaries(),
+        "Temperature ratings: ordinary 68.33°C, intermediate 93.3, high 141, extra_high 182.",
+        "RTI: standard 148, QR 50, ESFR 36, residential 28 (m·s)^0.5.",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_sprinkler(
+    position: list[float],
+    sprinkler_type: str = "pendent",
+    k_factor: float | None = None,
+    pressure_psi: float | None = None,
+    flow_rate: float | None = None,
+    temperature_rating: str = "ordinary",
+    orientation: list[float] | None = None,
+    rti: float | None = None,
+    sprinkler_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Insert an NFPA 13 sprinkler head (pendent, upright, sidewall, ESFR, deluge, ...).
+
+    Args:
+        position: [x, y, z] of the head (m).
+        sprinkler_type: See list_sprinklers(). Aliases: pendant, sidewall, esfr, qr, 13d, deluge.
+        k_factor: Optional US K-factor (gpm/psi^0.5), e.g. 5.6, 8.0, 14.0, 16.8, 25.2.
+        pressure_psi: Operating pressure in psi (NFPA 13 min 7 psi for standard spray).
+        flow_rate: Override FLOW_RATE in L/min. Otherwise Q = K * sqrt(P) converted to L/min.
+        temperature_rating: ordinary/intermediate/high/... or a number in °C.
+        orientation: Spray axis [ox, oy, oz]. Default from the type (sidewall = +X).
+        rti: Override RTI (m·s)^0.5.
+        sprinkler_id: Optional DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    spec = resolve_sprinkler(sprinkler_type)
+    k_us = float(k_factor if k_factor is not None else spec["k_us"])
+    pressure = float(pressure_psi if pressure_psi is not None else spec["pressure_psi"])
+    q_lpm = float(flow_rate if flow_rate is not None else flow_lpm(k_us, pressure))
+    t_act = resolve_temperature_rating(temperature_rating)
+    if t_act is None:
+        t_act = spec["activation_temperature"]
+    model, path = _load(fds_path)
+    block = model.add_sprinkler_head(
+        position,
+        flow_rate=q_lpm,
+        activation_temperature=t_act,
+        rti=float(rti if rti is not None else spec["rti"]),
+        particle_velocity=float(spec["particle_velocity"]),
+        spray_angle=tuple(spec["spray_angle"]),
+        offset=float(spec["offset"]),
+        smokeview_id=str(spec["smokeview_id"]),
+        orientation=orientation or list(spec["orientation"]),
+        open_head=bool(spec["open_head"]),
+        sprinkler_id=sprinkler_id,
+        prop_id=model.unique_id(spec["name"]),
+    )
+    _save(model, path)
+    return (
+        f"Added {spec['name']} sprinkler in {path} ({spec['nfpa']})\n"
+        f"K={k_us} @ {pressure} psi → {q_lpm:.3g} L/min, "
+        f"T={t_act}°C, RTI={rti if rti is not None else spec['rti']}, "
+        f"SMOKEVIEW_ID={spec['smokeview_id']}\n"
+        f"{block}"
+    )
+
+
+@mcp.tool()
+def add_heat_detector(
+    position: list[float],
+    activation_temperature: float = 74.0,
+    rti: float = 50.0,
+    detector_id: str | None = None,
+    fds_path: str | None = None,
+) -> str:
+    """Add a heat detector (NFPA 72-style link; FDS QUANTITY='LINK TEMPERATURE').
+
+    Args:
+        position: [x, y, z] in meters.
+        activation_temperature: °C (ordinary 68.33, intermediate 93, high 141).
+        rti: (m·s)^0.5. Fast ≈ 50, standard ≈ 148.
+        detector_id: Optional DEVC ID.
+        fds_path: Model path. Defaults to the active model.
+    """
+    model, path = _load(fds_path)
+    block = model.add_heat_detector(
+        position,
+        activation_temperature=activation_temperature,
+        rti=rti,
+        detector_id=detector_id,
+    )
+    _save(model, path)
+    return f"Added heat detector in {path}\n{block}"
+
+
+@mcp.tool()
+def pyrosim_examples_index() -> str:
+    """Index of Thunderhead PyroSim 2026.1 examples wired into this MCP."""
+    return """\
+PyroSim 2026.1 examples → MCP tools
+https://www.thunderheadeng.com/docs/2026-1/pyrosim/examples/
+
+Fundamentals
+- Materials and Layered Surfaces → list_materials, add_material, add_layered_surface
+  http://firebid.umd.edu/material-database.php
+- Fire Protection Systems and Controls → add_sprinkler, add_control, add_smoke_detector, add_heat_detector
+- Basic Data Output → create_2d_slice, add_device, show_smoke
+- Fire Design Scenarios / How-to Scenarios → new_model + add_hrr_fire per case
+
+Applications
+- Modeling Fire → add_reaction, add_hrr_fire, add_hrrpua_fire, fire_stoichiometry, fire_modeling_guidance
+- Critical Velocity / NFPA 502 2020 calculator → nfpa_502_critical_velocity, set_pressure_solver
+- Modeling Jet Fans / Velocity Patch → add_velocity_patch, add_flow_vent, add_hvac_fan
+- t² HRR freeze / stop after device → add_hrr_fire(growth_rate=...), add_device(..., stop_fds via writer)
+- Pressure relief / leakage → add_pressure_zone, add_surface(leak_path=...)
+- Simple Wind → set_wind
+- Smoke visibility → show_smoke
+
+How-to
+- Combustion calculator HCN/HCl/soot → add_reaction(hcn_yield=, hcl_yield=, soot_yield=)
+- HVAC pressure drop → add_hvac_fan
+- Heat conduction / radiation on surfaces → add_layered_surface, add_material
+- MPI meshes → add_mesh (separate meshes; assign MPI in the FDS launch)
+
+NFPA references in presets
+- NFPA 13 / 13D / 13R / 15 sprinklers (list_sprinklers)
+- NFPA 72 heat-detector RTI classes (add_heat_detector)
+- NFPA 92/92B-style t² growth (add_fire_preset / add_hrr_fire growth_rate)
+- NFPA 502 critical velocity (nfpa_502_critical_velocity)
+"""
 
 
 def main() -> None:

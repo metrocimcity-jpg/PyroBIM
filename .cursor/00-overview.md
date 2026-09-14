@@ -1,32 +1,33 @@
 # PyroSim MCP Server — Overview
 
 ## Goal
-Build an MCP server that lets an AI assistant control **Thunderhead PyroSim/FDS** fire modeling workflows:
-- Insert fire presets (couch, cigarette, car, etc.) into a model
-- Add result outputs: 2D slices, volumetric data, smoke visualization
-- Run simulations and open Smokeview
+An MCP server so Cursor can generate and edit **Thunderhead PyroSim / NIST FDS** fire models as `.fds` text (not GUI automation).
 
-## Why text-based, not GUI automation
-PyroSim's native format is a `.fds` file — plain text, namelist-style (Fortran group syntax like `&SURF ... /`).
-The most reliable integration is **generating/editing `.fds` files directly**, then optionally shelling out to:
-- `fds.exe` (or `fds` on Linux) — runs the simulation
-- `smokeview.exe` — opens 3D visualization of results
+Current capabilities:
+- New/import/validate models; open PyroSim, FDS, Smokeview
+- Fire presets (couch, cigarette, car, wastebasket) and specified-HRR / HRRPUA / burn-away fires
+- Simple chemistry (`&REAC`), UMD FireBID materials, layered surfaces
+- NFPA 13/13D/13R/15 sprinklers, heat detectors, smoke detectors, activation controls
+- HVAC fans, flow vents, leakage zones, wind, velocity patches
+- NFPA 502 critical velocity and D\*/10 mesh guidance
+- Slices, isosurfaces, devices, smoke visualization
+- PyroSim sample library under `PYROSIM_SAMPLES`
 
-This avoids fragile UI scripting and works headless (good for MCP/CLI use).
+## Why text-based
+PyroSim’s native format is a `.fds` file (Fortran namelists). Editing namelists is reliable and headless.
 
 ## Stack
-- Language: Python (MCP official SDK: `mcp` package)
-- Core lib: a small `fds_writer.py` module that appends/edits namelist blocks
-- Transport: stdio (for Cursor)
+- Python MCP SDK (`mcp` package; FastMCP / MCPServer)
+- `pyrosim-mcp/server.py` plus `fds_writer.py`, `presets.py`, `materials.py`, `sprinklers.py`, `fire_calcs.py`, `catalog.py`
 
 ## File map (this folder)
 | File | Purpose |
 |---|---|
 | `00-overview.md` | this file |
-| `01-mcp-tools.md` | tool definitions/schemas to implement |
-| `02-fire-presets.md` | preset fire data (HRR curves, growth rates) |
-| `03-fds-syntax-reference.md` | FDS namelist snippets used by the tools |
-| `04-cursor-build-instructions.md` | step-by-step build/setup guide |
-| `05-example-prompts.md` | sample prompts to test once built |
+| `01-mcp-tools.md` | live tool catalog |
+| `02-fire-presets.md` | fire / chemistry / NFPA data notes |
+| `03-fds-syntax-reference.md` | namelist snippets |
+| `04-cursor-build-instructions.md` | setup and MCP config |
+| `05-example-prompts.md` | 100 sample prompts by difficulty |
 
-Give Cursor all 6 files as project context, then start with `04-cursor-build-instructions.md`.
+Use `05-example-prompts.md` when exercising the connected `pyrosim` MCP server.

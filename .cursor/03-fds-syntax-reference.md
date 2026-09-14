@@ -72,3 +72,31 @@ Smoke rendering in Smokeview also depends on `SOOT_YIELD` in `&REAC` — no soot
 ... surfaces, obst, vents, slcf, devc ...
 &TAIL /
 ```
+
+## Material + layered surface
+```
+&MATL ID='GYPSUM', CONDUCTIVITY=0.17, SPECIFIC_HEAT=1.09, DENSITY=930, EMISSIVITY=0.9 /
+&SURF ID='wall', MATL_ID='GYPSUM','INSULATION','GYPSUM', THICKNESS=0.01,0.09,0.01, BACKING='VOID' /
+```
+
+## Sprinkler (NFPA 13 pendent)
+```
+&PROP ID='pendent', QUANTITY='SPRINKLER LINK TEMPERATURE', OFFSET=0.1, PART_ID='water drops',
+      FLOW_RATE=56.1, PARTICLE_VELOCITY=10, SPRAY_ANGLE=30,80,
+      ACTIVATION_TEMPERATURE=68.33, RTI=148, SMOKEVIEW_ID='sprinkler_pendent' /
+&DEVC ID='Spr_1', XYZ=5,5,2.9, PROP_ID='pendent', ORIENTATION=0,0,-1 /
+```
+
+## Sidewall throw (+X)
+```
+&DEVC ID='SW_1', XYZ=0.1,5,2.4, PROP_ID='sidewall', ORIENTATION=1,0,0 /
+```
+
+## Velocity patch (jet fan)
+```
+&PROP ID='vx', VELOCITY_COMPONENT=1, P0=-18 /
+&DEVC ID='jet_patch_clock', XYZ=0,0,0, QUANTITY='TIME', SETPOINT=0 /
+&DEVC ID='velocity_patch', XB=1,2,1,1.25,2.5,2.75, QUANTITY='VELOCITY PATCH', PROP_ID='vx', DEVC_ID='jet_patch_clock' /
+```
+
+PyroSim requires every `&SLCF` to have `PBX`/`PBY`/`PBZ` or `XB`. Do not emit geometry-less slices.

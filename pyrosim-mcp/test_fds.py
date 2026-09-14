@@ -190,6 +190,82 @@ class ToolWorkflowTests(unittest.TestCase):
         census = server.inspect_model()
         self.assertIn("door_crack", census)
 
+    def test_firebid_oak_and_layered_wall(self):
+        listing = server.list_materials("hardwood")
+        self.assertIn("Oak", listing)
+        server.new_model("mats", [0, 4, 0, 4, 0, 3], 0.2)
+        oak = server.add_material("Oak")
+        self.assertIn("&MATL ID='OAK'", oak)
+        self.assertIn("CONDUCTIVITY=0.17", oak)
+        wall = server.add_layered_surface(
+            "Default_Wall",
+            ["GYPSUM", "INSULATION", "GYPSUM"],
+            [0.01, 0.09, 0.01],
+        )
+        self.assertIn("MATL_ID='GYPSUM','INSULATION','GYPSUM'", wall)
+        self.assertIn("THICKNESS=0.01,0.09,0.01", wall)
+        valid = server.validate_fds()
+        self.assertTrue(valid.startswith("VALID"), valid)
+
+    def test_simple_chemistry_and_hrr_fire(self):
+        fuels = server.list_fuels()
+        self.assertIn("PROPANE", fuels)
+        stoich = server.fire_stoichiometry(1858.0, 1.44, "N-HEPTANE")
+        self.assertIn("HRRPUA=1290", stoich)
+        server.new_model("vtt", [0, 10, 0, 10, 0, 5], 0.2)
+        reac = server.add_reaction("PROPANE")
+        self.assertIn("FUEL='PROPANE'", reac)
+        self.assertIn("RADIATIVE_FRACTION=0.3", reac)
+        fire = server.add_hrr_fire(
+            1858.0,
+            1.44,
+            [1, 1, 0],
+            fuel="N-HEPTANE",
+            hrr_curve=[[0, 0], [13, 1245], [288, 1858], [438, 0]],
+        )
+        self.assertIn("HRRPUA=1290", fire)
+        self.assertIn("&RAMP", fire)
+        burn = server.add_hrrpua_fire(
+            500.0,
+            [3, 4, 3, 4, 0, 0.1],
+            fuel="WOOD",
+            tmp_ign=300.0,
+            burn_away=True,
+        )
+        self.assertIn("TMP_IGN=300", burn)
+        self.assertIn("BURN_AWAY=.TRUE.", burn)
+        valid = server.validate_fds()
+        self.assertTrue(valid.startswith("VALID"), valid)
+
+    def test_nfpa13_sprinkler_types(self):
+        listing = server.list_sprinklers()
+        for name in (
+            "pendent",
+            "upright",
+            "sidewall",
+            "esfr_pendent",
+            "deluge",
+            "residential_sidewall",
+        ):
+            self.assertIn(name, listing)
+        server.new_model("spr", [0, 10, 0, 10, 0, 3], 0.2)
+        pendent = server.add_sprinkler([5, 5, 2.9], "pendent")
+        self.assertIn("SMOKEVIEW_ID='sprinkler_pendent'", pendent)
+        self.assertIn("ORIENTATION=0,0,-1", pendent)
+        sidewall = server.add_sprinkler([1, 5, 2.4], "sidewall")
+        self.assertIn("ORIENTATION=1,0,0", sidewall)
+        open_head = server.add_sprinkler([8, 5, 2.9], "deluge")
+        self.assertIn("SMOKEVIEW_ID='nozzle'", open_head)
+        self.assertIn("QUANTITY='TIME'", open_head)
+        self.assertIn("SETPOINT=0", open_head)
+        vc = server.nfpa_502_critical_velocity(20000.0, 5.0, 60.0)
+        self.assertIn("V_c=", vc)
+        patch = server.add_velocity_patch([1, 2, 1, 1.25, 1, 1.25], -18.0, "x")
+        self.assertIn("VELOCITY PATCH", patch)
+        self.assertIn("VELOCITY_COMPONENT=1", patch)
+        valid = server.validate_fds()
+        self.assertTrue(valid.startswith("VALID"), valid)
+
     def test_t_squared_peak_matches_alpha(self):
         alpha = presets.GROWTH_ALPHA["ultra-fast"]
         peak = 2500.0
